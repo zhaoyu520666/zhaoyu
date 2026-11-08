@@ -1,38 +1,69 @@
 import SwiftUI
 import WebKit
 
-// MARK: - 每个 Tab 的 WebView 状态
+// MARK: - 站点底部导航项（对应网站自带底栏）
+struct SiteTab: Identifiable, Equatable {
+    let id: Int
+    let label: String       // 同时用于在网页 DOM 中定位同名导航项
+    let icon: String
+    let fallback: URL
+}
+
+let siteTabs: [SiteTab] = [
+    SiteTab(id: 0, label: "主页", icon: "house.fill",
+            fallback: URL(string: "https://hanime1.me/")!),
+    SiteTab(id: 1, label: "本日排行", icon: "rectangle.stack.fill",
+            fallback: URL(string: "https://hanime1.me/")!),
+    SiteTab(id: 2, label: "订阅内容", icon: "play.rectangle.fill",
+            fallback: URL(string: "https://hanime1.me/")!),
+    SiteTab(id: 3, label: "我的", icon: "person.crop.square.fill",
+            fallback: URL(string: "https://hanime1.me/")!),
+]
+
+// MARK: - WebView 状态
 final class WebViewModel: ObservableObject {
     @Published var progress: Double = 0
     @Published var isLoading = false
     @Published var canGoBack = false
     @Published var canGoForward = false
+    @Published var currentTab: Int = 0
     weak var webView: WKWebView?
 }
 
-// MARK: - 主界面：底部 Tab（看番 App 风格）
+// MARK: - 主界面
 struct ContentView: View {
-    @StateObject private var downloadManager = DownloadManager.shared
+    @StateObject private var downloads = DownloadManager.shared
+    @StateObject private var model = WebViewModel()
+    @State private var showDownloads = false
 
     var body: some View {
-        TabView {
-            SiteTabView(title: "首页", icon: "house.fill", url: URL(string: "https://hanime1.me/")!)
-                .tabItem { Label("首页", systemImage: "house.fill") }
+        VStack(spacing: 0) {
+            TabHeader(
+                title: "Hanime",
+                icon: "play.rectangle.fill",
+                isLoading: model.isLoading,
+                onReload: { model.webView?.reload() },
+                extraIcon: "arrow.down.circle",
+                onExtra: { showDownloads = true }
+            )
 
-            SiteTabView(title: "搜索", icon: "magnifyingglass", url: URL(string: "https://hanime1.me/search?v=")!)
-                .tabItem { Label("搜索", systemImage: "magnifyingglass") }
+            if model.isLoading {
+                ProgressView(value: model.progress)
+                    .progressViewStyle(.linear)
+                    .tint(.pink)
+                    .frame(height: 2)
+            }
 
-            SiteTabView(title: "追番", icon: "heart.fill", url: URL(string: "https://hanime1.me/watchlist")!)
-                .tabItem { Label("追番", systemImage: "heart.fill") }
+            WebViewContainer(model: model, initialURL: siteTabs[0].fallback)
 
-            DownloadsTabView()
-                .tabItem { Label("下载", systemImage: "arrow.down.circle") }
+            BottomNavBar(model: model) { tab in
+                navigate(to: tab)
+            }
         }
-        .tint(Color(red: 0.96, green: 0.44, blue: 0.55))
-        .preferredColorScheme(.dark) // 网站本身是暗色主题，保持一致
-        // 全局下载提示（Toast）
+        .background(Color(red: 0.07, green: 0.07, blue: 0.09).ignoresSafeArea())
+        .preferredColorScheme(.dark)
         .overlay(alignment: .top) {
-            if let toast = downloadManager.toast {
+            if let toast = downloads.toast {
                 Text(toast)
                     .font(.footnote)
                     .foregroundColor(.white)
@@ -43,16 +74,37 @@ struct ContentView: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
-        .animation(.easeInOut(duration: 0.25), value: downloadManager.toast)
+        .animation(.easeInOut(duration: 0.25), value: downloads.toast)
+        .fullScreenCover(isPresented: $showDownloads) {
+            DownloadsTabView(onClose: { showDownloads = false })
+        }
+    }
+
+    /// 用网站自己的底栏地址跳转，找不到时退回首页
+    private func navigate(to tab: SiteTab) {
+        model.currentTab = tab.id
+        let js = "window.__hnNav ? window.__hnNav('\(tab.label)') : '';"
+        model.webView?.evaluateJavaScript(js) { result, _ in
+            if let href = result as? String, !href.isEmpty, href != "clicked",
+               let url = URL(string: href) {
+                model.webView?.load(URLRequest(url: url))
+            } else if let res = result as? String, res == "clicked" {
+                // 站内脚本自行处理了跳转
+            } else {
+                model.webView?.load(URLRequest(url: tab.fallback))
+            }
+        }
     }
 }
 
-// MARK: - 公共顶部栏
+// MARK: - 顶部栏
 struct TabHeader: View {
     let title: String
     let icon: String
-    var onReload: (() -> Void)? = nil
     var isLoading: Bool = false
+    var onReload: (() -> Void)? = nil
+    var extraIcon: String? = nil
+    var onExtra: (() -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 12) {
@@ -69,6 +121,13 @@ struct TabHeader: View {
                         .foregroundColor(.white)
                 }
             }
+            if let extraIcon = extraIcon, let onExtra = onExtra {
+                Button(action: onExtra) {
+                    Image(systemName: extraIcon)
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundColor(.white)
+                }
+            }
         }
         .padding(.horizontal, 16)
         .frame(height: 44)
@@ -76,43 +135,43 @@ struct TabHeader: View {
     }
 }
 
-// MARK: - 单个网页 Tab
-struct SiteTabView: View {
-    let title: String
-    let icon: String
-    let url: URL
-
-    @StateObject private var model = WebViewModel()
+// MARK: - 底部原生导航栏（主页 / 本日排行 / 订阅内容 / 我的 + 前进后退）
+struct BottomNavBar: View {
+    @ObservedObject var model: WebViewModel
+    var onSelect: (SiteTab) -> Void
 
     var body: some View {
-        VStack(spacing: 0) {
-            // 顶部 App 栏：网页内容从安全区下方开始，
-            // 不再顶进刘海/灵动岛，网站的导航和搜索栏都能正常点按
-            TabHeader(
-                title: title,
-                icon: icon,
-                onReload: { model.webView?.reload() },
-                isLoading: model.isLoading
-            )
-
-            // 页面加载进度条
-            if model.isLoading {
-                ProgressView(value: model.progress)
-                    .progressViewStyle(.linear)
-                    .tint(.pink)
-                    .frame(height: 2)
+        HStack(spacing: 0) {
+            ForEach(siteTabs) { tab in
+                Button {
+                    onSelect(tab)
+                } label: {
+                    VStack(spacing: 3) {
+                        Image(systemName: tab.icon)
+                            .font(.system(size: 19, weight: .medium))
+                        Text(tab.label)
+                            .font(.system(size: 10))
+                    }
+                    .foregroundColor(model.currentTab == tab.id ? .white : Color(white: 0.55))
+                    .frame(maxWidth: .infinity)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
             }
 
-            WebViewContainer(model: model, initialURL: url)
-        }
-        .background(Color(red: 0.07, green: 0.07, blue: 0.09).ignoresSafeArea())
-        // 悬浮前进/后退胶囊（有历史记录时才出现）
-        .overlay(alignment: .bottomTrailing) {
-            HStack(spacing: 20) {
+            Rectangle()
+                .fill(Color.white.opacity(0.15))
+                .frame(width: 1, height: 24)
+
+            HStack(spacing: 16) {
                 Button {
                     model.webView?.goBack()
                 } label: {
                     Image(systemName: "chevron.backward")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(model.canGoBack ? .white : Color(white: 0.35))
+                        .frame(width: 30, height: 40)
+                        .contentShape(Rectangle())
                 }
                 .disabled(!model.canGoBack)
 
@@ -120,19 +179,18 @@ struct SiteTabView: View {
                     model.webView?.goForward()
                 } label: {
                     Image(systemName: "chevron.forward")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(model.canGoForward ? .white : Color(white: 0.35))
+                        .frame(width: 30, height: 40)
+                        .contentShape(Rectangle())
                 }
                 .disabled(!model.canGoForward)
             }
-            .font(.system(size: 15, weight: .semibold))
-            .foregroundStyle(.white)
-            .padding(.horizontal, 20)
-            .padding(.vertical, 10)
-            .background(.thinMaterial, in: Capsule())
-            .padding(.trailing, 14)
-            .padding(.bottom, 8)
-            .opacity(model.canGoBack || model.canGoForward ? 1 : 0)
-            .animation(.easeInOut(duration: 0.2), value: model.canGoBack || model.canGoForward)
+            .buttonStyle(.plain)
+            .padding(.horizontal, 10)
         }
+        .frame(height: 54)
+        .background(Color(red: 0.13, green: 0.13, blue: 0.14).ignoresSafeArea(edges: .bottom))
     }
 }
 
@@ -152,6 +210,12 @@ struct WebViewContainer: UIViewRepresentable {
         config.mediaTypesRequiringUserActionForPlayback = []
         // Cookie / 登录状态持久保存
         config.websiteDataStore = .default()
+        // 广告拦截脚本（含弹窗拦截、广告元素隐藏、底部导航接管）
+        config.userContentController.addUserScript(
+            WKUserScript(source: AdBlocker.bootstrapJS,
+                         injectionTime: .atDocumentEnd,
+                         forMainFrameOnly: false)
+        )
 
         let wv = WKWebView(frame: .zero, configuration: config)
         wv.navigationDelegate = context.coordinator
@@ -191,32 +255,76 @@ struct WebViewContainer: UIViewRepresentable {
             ]
         }
 
-        // 站外链接交给系统 Safari；视频/文件直链转交下载管理器；其余放行
+        // MARK: 导航策略：拦广告跳转 + 媒体直链转下载
         func webView(
             _ webView: WKWebView,
             decidePolicyFor navigationAction: WKNavigationAction,
             decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
         ) {
-            // 点击视频直链（.mp4 等）→ 直接开始下载
-            if navigationAction.navigationType == .linkActivated,
-               let url = navigationAction.request.url,
-               DownloadManager.isDirectMediaURL(url) {
-                decisionHandler(.cancel)
-                DownloadManager.shared.startDownload(from: url, webView: webView)
+            guard let url = navigationAction.request.url else {
+                decisionHandler(.allow)
                 return
             }
 
-            if navigationAction.navigationType == .linkActivated,
-               let url = navigationAction.request.url,
-               let host = url.host?.lowercased(),
-               !host.contains("hanime") {
+            let scheme = url.scheme?.lowercased() ?? ""
+            if scheme.isEmpty || scheme == "about" || scheme == "blob" || scheme == "data" {
+                decisionHandler(.allow)
+                return
+            }
+
+            // 1) 视频/媒体直链 → 交给下载器，并用视频标题命名
+            if DownloadManager.isDirectMediaURL(url) {
                 decisionHandler(.cancel)
-                DispatchQueue.main.async {
-                    UIApplication.shared.open(url)
+                startDownload(url: url, webView: webView)
+                return
+            }
+
+            // 2) 广告域名 → 直接丢弃，不跳转、不开 Safari
+            if AdBlocker.isAdURL(url) {
+                decisionHandler(.cancel)
+                return
+            }
+
+            let host = (url.host ?? "").lowercased()
+            let isSite = host.contains("hanime")
+
+            // 3) 站外地址
+            if !isSite {
+                if navigationAction.navigationType == .linkActivated && navigationAction.targetFrame != nil {
+                    // 用户自己点的外链，交给系统浏览器（正常浏览行为）
+                    decisionHandler(.cancel)
+                    DispatchQueue.main.async { UIApplication.shared.open(url) }
+                } else {
+                    // JS 重定向 / 隐藏广告层触发的强制跳转：静默拦掉
+                    decisionHandler(.cancel)
                 }
                 return
             }
+
             decisionHandler(.allow)
+        }
+
+        /// 用当前视频页的标题作为文件名
+        private func startDownload(url: URL, webView: WKWebView) {
+            let js = #"""
+            (function () {
+              function clean(s) { return (s || "").replace(/\s+/g, " ").trim(); }
+              var t = "";
+              var h1 = document.querySelector("h1");
+              if (h1 && clean(h1.innerText).length > 1) { t = clean(h1.innerText); }
+              if (!t) {
+                var og = document.querySelector('meta[property="og:title"]');
+                if (og && og.content) { t = clean(og.content); }
+              }
+              if (!t) { t = clean(document.title); }
+              return t;
+            })();
+            """#
+            webView.evaluateJavaScript(js) { result, _ in
+                let raw = (result as? String) ?? ""
+                let title = raw.isEmpty ? webView.title : raw
+                DownloadManager.shared.startDownload(from: url, webView: webView, title: title)
+            }
         }
 
         // 服务器返回不可显示的文件（octet-stream / video 等）→ 转交下载
@@ -231,21 +339,26 @@ struct WebViewContainer: UIViewRepresentable {
                 || mime.contains("octet-stream") {
                 if let url = navigationResponse.response.url {
                     decisionHandler(.cancel)
-                    DownloadManager.shared.startDownload(from: url, webView: webView)
+                    startDownload(url: url, webView: webView)
                     return
                 }
             }
             decisionHandler(.allow)
         }
 
-        // 新窗口链接（target="_blank"）改为当前页打开，避免点了没反应
+        // 站内 target="_blank" 改在当前页打开；站外新窗口一律不创建（广告弹窗来源）
         func webView(
             _ webView: WKWebView,
             createWebViewWith configuration: WKWebViewConfiguration,
             for navigationAction: WKNavigationAction,
             windowFeatures: WKWindowFeatures
         ) -> WKWebView? {
-            webView.load(navigationAction.request)
+            if let url = navigationAction.request.url,
+               let host = url.host?.lowercased(),
+               host.contains("hanime"),
+               !AdBlocker.isAdURL(url) {
+                webView.load(navigationAction.request)
+            }
             return nil
         }
     }

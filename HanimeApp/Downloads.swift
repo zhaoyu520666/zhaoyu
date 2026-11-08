@@ -71,8 +71,10 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
     }
 
     /// 开始下载（先把 WebView 的登录 Cookie 同步给 URLSession）
-    func startDownload(from url: URL, webView: WKWebView? = nil) {
-        func begin() { self.beginDownload(from: url) }
+    /// - Parameter title: 视频标题，用来给文件命名
+    func startDownload(from url: URL, webView: WKWebView? = nil, title: String? = nil) {
+        let fileName = makeFileName(title: title, url: url)
+        func begin() { self.beginDownload(from: url, fileName: fileName) }
         if let store = webView?.configuration.websiteDataStore.httpCookieStore {
             store.getAllCookies { cookies in
                 for c in cookies { HTTPCookieStorage.shared.setCookie(c) }
@@ -83,7 +85,7 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         }
     }
 
-    private func beginDownload(from url: URL) {
+    private func beginDownload(from url: URL, fileName: String) {
         if items.contains(where: { $0.remoteURL == url && $0.state == .downloading }) {
             showToast("该视频已在下载队列中")
             return
@@ -93,16 +95,44 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
                          forHTTPHeaderField: "User-Agent")
         let task = session.downloadTask(with: request)
-        let item = DownloadItem(fileName: suggestedName(from: url), remoteURL: url)
+        task.taskDescription = fileName   // 下载完成后用这个名字落盘（跨线程安全）
+        let item = DownloadItem(fileName: fileName, remoteURL: url)
         tasks[item.id] = task
         items.insert(item, at: 0)
         task.resume()
-        showToast("已开始下载：\(item.fileName)")
+        showToast("已开始下载：\(fileName)")
     }
 
-    private func suggestedName(from url: URL) -> String {
-        let name = url.lastPathComponent
-        return name.isEmpty ? "video.mp4" : name
+    // MARK: 文件名
+    /// 优先用视频标题命名：清理站名后缀、非法字符，补上扩展名
+    private func makeFileName(title: String?, url: URL) -> String {
+        var base = (title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // 去掉 "- Hanime1.me" / "| Hanime1.me" 之类的站点后缀
+        for separator in [" - ", " | ", " – ", " — ", "｜"] {
+            let parts = base.components(separatedBy: separator)
+            if parts.count > 1, parts.last!.lowercased().contains("hanime") {
+                base = parts.dropLast().joined(separator: separator)
+            }
+        }
+        base = base.replacingOccurrences(of: "Hanime1.me", with: "", options: .caseInsensitive)
+        base = base.replacingOccurrences(of: "Hanime1", with: "", options: .caseInsensitive)
+        base = base.trimmingCharacters(in: CharacterSet(charactersIn: " -|｜_."))
+
+        // 标题太长时截断，避免文件名过长
+        if base.count > 80 {
+            base = String(base.prefix(80))
+        }
+        if base.isEmpty {
+            base = url.deletingPathExtension().lastPathComponent
+        }
+        base = sanitize(base)
+
+        var ext = url.pathExtension.lowercased()
+        if ext.isEmpty || ext.count > 5 {
+            ext = "mp4"
+        }
+        return "\(base).\(ext)"
     }
 
     /// 取消进行中的下载 / 删除已完成文件
@@ -129,8 +159,10 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
     // MARK: 文件名处理
     private func sanitize(_ name: String) -> String {
         let invalid = CharacterSet(charactersIn: "/\\?%*|\"<>:")
-        let cleaned = name.components(separatedBy: invalid).joined(separator: "-")
-        return cleaned.isEmpty ? "video.mp4" : cleaned
+        let cleaned = name.components(separatedBy: invalid)
+            .joined(separator: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? "video" : cleaned
     }
 
     private func uniqueDestination(_ name: String) -> URL {
@@ -168,10 +200,18 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                     didFinishDownloadingTo location: URL) {
-        var name = downloadTask.response?.suggestedFilename
+        // 优先用「视频标题」命名的名字（startDownload 时写进 taskDescription）
+        var name = downloadTask.taskDescription
+            ?? downloadTask.response?.suggestedFilename
             ?? downloadTask.originalRequest?.url?.lastPathComponent
             ?? "video.mp4"
         name = sanitize(name)
+
+        if (name as NSString).pathExtension.isEmpty {
+            let ext = ((downloadTask.response?.suggestedFilename ?? "") as NSString).pathExtension
+            name += "." + (ext.isEmpty ? "mp4" : ext.lowercased())
+        }
+
         let dest = uniqueDestination(name)
         if FileManager.default.fileExists(atPath: dest.path) {
             try? FileManager.default.removeItem(at: dest)
@@ -182,14 +222,15 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
             try? FileManager.default.copyItem(at: location, to: dest)
             try? FileManager.default.removeItem(at: location)
         }
+        let finalName = dest.lastPathComponent
         DispatchQueue.main.async {
             guard let (index, id) = self.entry(for: downloadTask) else { return }
             self.items[index].state = .completed
             self.items[index].progress = 1
-            self.items[index].fileName = name
+            self.items[index].fileName = finalName
             self.items[index].localURL = dest
             self.tasks[id] = nil
-            self.showToast("下载完成：\(name)")
+            self.showToast("下载完成：\(finalName)")
         }
     }
 
@@ -209,14 +250,21 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
     }
 }
 
-// MARK: - 下载 Tab
+// MARK: - 下载列表页
 struct DownloadsTabView: View {
+    var onClose: (() -> Void)? = nil
+
     @StateObject private var manager = DownloadManager.shared
     @State private var playingItem: DownloadItem?
 
     var body: some View {
         VStack(spacing: 0) {
-            TabHeader(title: "下载", icon: "arrow.down.circle")
+            TabHeader(
+                title: "下载",
+                icon: "arrow.down.circle",
+                extraIcon: onClose == nil ? nil : "xmark",
+                onExtra: onClose
+            )
 
             Group {
                 if manager.items.isEmpty {
