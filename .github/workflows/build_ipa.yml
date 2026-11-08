@@ -15,15 +15,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Generate Xcode project with xcodegen
+        run: |
+          command -v xcodegen >/dev/null 2>&1 || brew install xcodegen
+          xcodegen generate
+
       - name: Build (unsigned, for self-signing)
         run: |
+          set -o pipefail
           xcodebuild -project HanimeApp.xcodeproj \
             -scheme HanimeApp \
             -configuration Release \
             -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGN_IDENTITY=""
+            CODE_SIGN_IDENTITY="" | tail -40
 
           mkdir -p Payload
           cp -r build/Build/Products/Release-iphoneos/HanimeApp.app Payload/
