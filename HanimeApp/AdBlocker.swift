@@ -3,8 +3,8 @@ import WebKit
 
 // MARK: - 广告拦截
 /// 原则：宁漏勿杀。只隐藏"名字里明确写着广告"的元素 + 广告联盟域名的资源；
-/// 绝对不碰带 download / 下載 / 播放 / btn 之类的元素（上一版把站内的下载链接和播放按钮误藏了）。
-/// 强制跳转主要靠原生层拦截，不靠大面积隐藏。
+/// 绝对不碰带 download / 下載 / 播放 / btn 之类的元素。
+/// 强制跳转靠原生层拦截；下载类点击通过 hnapp:// 协议交给原生层接管。
 enum AdBlocker {
 
     /// 广告 / 弹窗联盟域名关键词
@@ -31,7 +31,7 @@ enum AdBlocker {
         return false
     }
 
-    /// 注入到网页的脚本：拦弹窗 + 严格隐藏广告 + 隐藏网页自带底栏（App 原生底栏代替）
+    /// 注入到网页的脚本：拦弹窗 + 严格隐藏广告 + 隐藏网页自带底栏 + 下载点击接管
     static let bootstrapJS: String = ##"""
     (function () {
       if (window.__hnAppReady) { return; }
@@ -40,43 +40,70 @@ enum AdBlocker {
       var AD_HOST = /(doubleclick|googlesyndication|googleadservices|adservice\.google|adsystem|adnxs|rubiconproject|pubmatic|openx\.net|smartadserver|criteo|taboola|outbrain|mgid\.|revcontent|zedo|yieldmo|popads|popcash|propellerads|clickadu|exoclick|juicyads|trafficjunky|adsterra|hilltopads|onclck|bidswitch|casalemedia|moatads|sharethrough|teads|adsrvr|applovin|unityads|vungle|ironsrc|chartboost|inmobi|smaato|trafficstars|adspyglass|popunder|adcash|adfox|adriver)/i;
 
       // 白名单：凡是带这些字样（下载 / 播放 / 按钮）的元素绝对不动
-      var SAFE = /(download|dl-|下載|下载|play|播放|btn|button|link|watch)/i;
+      var SAFE = /(download|dl[\s_\-]|下載|下载|播放|play|btn|button|link|watch)/i;
 
-      // 严格广告标识：只有明确写着广告命名的才隐藏
-      var STRICT_AD = /(adsbygoogle|adsense|advertisement|advertisment|contentads|ad-banner|ad_banner|ad-slot|ad_slot|ad-unit|ad_unit|ad-container|ad_container|ad-wrapper|ad_wrapper|ad-box|ad_box|adframe|ad-frame|adsbox|ads-box|advert-box|advertbox|advert-container|popunder|popads|banner-ad|banner_ad|dfp-ad|google-ad|sponsor-ad|taboola|outbrain)/i;
+      // 下载意图：用于把下载类点击交给原生层（比 SAFE 更严格，避免误转普通外链）
+      var DL = /(^|[\s_\-])(download|下載|下载|dl)([\s_\-]|$)|下載|下载/i;
 
       // 记录"用户刚点的是不是下载/播放类元素"，这类触发的 window.open 放行
       var lastClickSafe = false;
       var safeTimer = null;
+
+      function clickDesc(t) {
+        var desc = "";
+        if (!t) { return desc; }
+        desc += " " + (t.innerText || t.textContent || "");
+        var box = t.closest ? t.closest("a, button, div, li, td") : null;
+        if (box) {
+          desc += " " + (typeof box.className === "string" ? box.className : "");
+          desc += " " + (box.getAttribute("href") || "");
+        }
+        return desc;
+      }
+
+      // 捕获阶段监听点击：标记下载/播放意图 + 把下载类站外链接转交原生层
       document.addEventListener("click", function (ev) {
         var t = null;
         try { t = ev.target; } catch (e) { return; }
-        var desc = "";
-        if (t) {
-          desc += " " + (t.innerText || t.textContent || "");
-          var box = t.closest ? t.closest("a, button, div, li, td") : null;
-          if (box) {
-            desc += " " + (typeof box.className === "string" ? box.className : "");
-            desc += " " + (box.getAttribute("href") || "");
-          }
-        }
+        var desc = clickDesc(t);
         if (SAFE.test(desc)) {
           lastClickSafe = true;
           if (safeTimer) { clearTimeout(safeTimer); }
           safeTimer = setTimeout(function () { lastClickSafe = false; }, 1500);
         }
+
+        // 站外"下载意图"链接：阻止默认行为，走 hnapp:// 让原生层接管
+        var a = t && t.closest ? t.closest("a[href]") : null;
+        if (!a) { return; }
+        var href = a.getAttribute("href") || "";
+        if (!href || href.charAt(0) === "#" || href.indexOf("javascript:") === 0) { return; }
+        var u;
+        try { u = new URL(href, location.href); } catch (e) { return; }
+        if (!u.hostname) { return; }
+        var isMedia = /\.(mp4|webm|mov|m4v|mkv|ts)(\?|#|$)/i.test(u.pathname + u.search);
+        if (/hanime/i.test(u.hostname) || isMedia || !DL.test(desc)) { return; }
+        try {
+          ev.preventDefault();
+          ev.stopPropagation();
+          location.href = "hnapp://open?url=" + encodeURIComponent(u.href);
+        } catch (e) {}
       }, true);
 
-      // ---- 1) 弹窗：只放行站内、视频直链、以及用户点了下载/播放后的跳转 ----
-      var nativeOpen = window.open;
+      // ---- 1) 弹窗：不放行任何真弹窗，改为当前页跳转让原生层接管 ----
+      //     站内/媒体 → 直接跳（原生会自动转下载）；下载意图的站外页 → hnapp 标记
       window.open = function (url) {
         try {
           var u = new URL(url || "", location.href);
+          if (AD_HOST.test(u.hostname)) { return null; }
           var sameSite = /hanime/i.test(u.hostname);
-          var isMedia = /\.(mp4|webm|mov|m4v|mkv|ts|zip|apk)(\?|$)/i.test(u.pathname + u.search);
-          if (!AD_HOST.test(u.hostname) && (sameSite || isMedia || lastClickSafe)) {
+          var isMedia = /\.(mp4|webm|mov|m4v|mkv|ts)(\?|#|$)/i.test(u.pathname + u.search);
+          if (sameSite || isMedia || lastClickSafe) {
             lastClickSafe = false;
-            return nativeOpen.apply(window, arguments);
+            if (sameSite || isMedia) {
+              location.href = u.href;
+            } else {
+              location.href = "hnapp://open?url=" + encodeURIComponent(u.href);
+            }
           }
         } catch (e) { /* URL 非法/为空：拦掉 */ }
         return null;
@@ -104,9 +131,9 @@ enum AdBlocker {
 
           var idc = ((el.id || "") + " " + (typeof el.className === "string" ? el.className : "")).trim();
           if (!idc) { continue; }
-          // 白名单优先：下载/播放/按钮类一律跳过
           if (SAFE.test(idc)) { continue; }
           if (SAFE.test((el.innerText || "").slice(0, 60))) { continue; }
+          var STRICT_AD = /(adsbygoogle|adsense|advertisement|advertisment|contentads|ad-banner|ad_banner|ad-slot|ad_slot|ad-unit|ad_unit|ad-container|ad_container|ad-wrapper|ad_wrapper|ad-box|ad_box|adframe|ad-frame|adsbox|ads-box|advert-box|advertbox|advert-container|popunder|popads|banner-ad|banner_ad|dfp-ad|google-ad|sponsor-ad|taboola|outbrain)/i;
           if (STRICT_AD.test(idc)) { hide(el); }
         }
       }

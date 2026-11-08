@@ -272,6 +272,13 @@ struct WebViewContainer: UIViewRepresentable {
                 return
             }
 
+            // 0) 网页脚本标记的"用户下载意图"跳转：hnapp://open?url=<encoded>
+            if scheme == "hnapp" {
+                decisionHandler(.cancel)
+                handleAppScheme(url, webView: webView)
+                return
+            }
+
             // 1) 视频/媒体直链 → 交给下载器，并用视频标题命名
             if DownloadManager.isDirectMediaURL(url) {
                 decisionHandler(.cancel)
@@ -302,6 +309,20 @@ struct WebViewContainer: UIViewRepresentable {
             }
 
             decisionHandler(.allow)
+        }
+
+        /// 解析 hnapp://open?url=<encoded>：媒体直链转下载，其余当作用户主动访问的页面
+        private func handleAppScheme(_ url: URL, webView: WKWebView) {
+            guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+                  let raw = comps.queryItems?.first(where: { $0.name == "url" })?.value,
+                  let target = URL(string: raw) else { return }
+            if AdBlocker.isAdURL(target) { return }
+            if DownloadManager.isDirectMediaURL(target) {
+                startDownload(url: target, webView: webView)
+            } else {
+                // 下载中转页等：在当前页打开，若返回的是文件会再被转成交给下载器
+                webView.load(URLRequest(url: target))
+            }
         }
 
         /// 用当前视频页的标题作为文件名
@@ -346,18 +367,23 @@ struct WebViewContainer: UIViewRepresentable {
             decisionHandler(.allow)
         }
 
-        // 站内 target="_blank" 改在当前页打开；站外新窗口一律不创建（广告弹窗来源）
+        // 站内 target="_blank" 改在当前页打开；新窗口里的媒体直链直接下载；站外新窗口一律不创建
         func webView(
             _ webView: WKWebView,
             createWebViewWith configuration: WKWebViewConfiguration,
             for navigationAction: WKNavigationAction,
             windowFeatures: WKWindowFeatures
         ) -> WKWebView? {
-            if let url = navigationAction.request.url,
-               let host = url.host?.lowercased(),
-               host.contains("hanime"),
-               !AdBlocker.isAdURL(url) {
-                webView.load(navigationAction.request)
+            if let url = navigationAction.request.url {
+                if DownloadManager.isDirectMediaURL(url) {
+                    startDownload(url: url, webView: webView)
+                    return nil
+                }
+                if let host = url.host?.lowercased(),
+                   host.contains("hanime"),
+                   !AdBlocker.isAdURL(url) {
+                    webView.load(navigationAction.request)
+                }
             }
             return nil
         }
