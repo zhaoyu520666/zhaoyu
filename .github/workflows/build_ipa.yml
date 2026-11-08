@@ -1,0 +1,43 @@
+name: Build Unsigned IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build (unsigned, for self-signing)
+        run: |
+          xcodebuild -project HanimeApp.xcodeproj \
+            -scheme HanimeApp \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY=""
+
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/HanimeApp.app Payload/
+          zip -r HanimeApp-unsigned.ipa Payload
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HanimeApp-ipa
+          path: HanimeApp-unsigned.ipa
+
+      - name: Publish Release with IPA
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          files: HanimeApp-unsigned.ipa
