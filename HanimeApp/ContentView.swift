@@ -12,6 +12,8 @@ final class WebViewModel: ObservableObject {
 
 // MARK: - 主界面：底部 Tab（看番 App 风格）
 struct ContentView: View {
+    @StateObject private var downloadManager = DownloadManager.shared
+
     var body: some View {
         TabView {
             SiteTabView(title: "首页", icon: "house.fill", url: URL(string: "https://hanime1.me/")!)
@@ -22,13 +24,59 @@ struct ContentView: View {
 
             SiteTabView(title: "追番", icon: "heart.fill", url: URL(string: "https://hanime1.me/watchlist")!)
                 .tabItem { Label("追番", systemImage: "heart.fill") }
+
+            DownloadsTabView()
+                .tabItem { Label("下载", systemImage: "arrow.down.circle") }
         }
         .tint(Color(red: 0.96, green: 0.44, blue: 0.55))
         .preferredColorScheme(.dark) // 网站本身是暗色主题，保持一致
+        // 全局下载提示（Toast）
+        .overlay(alignment: .top) {
+            if let toast = downloadManager.toast {
+                Text(toast)
+                    .font(.footnote)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(.thinMaterial, in: Capsule())
+                    .padding(.top, 58)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: downloadManager.toast)
     }
 }
 
-// MARK: - 单个 Tab
+// MARK: - 公共顶部栏
+struct TabHeader: View {
+    let title: String
+    let icon: String
+    var onReload: (() -> Void)? = nil
+    var isLoading: Bool = false
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .foregroundColor(.pink)
+            Text(title)
+                .font(.headline)
+                .foregroundColor(.white)
+            Spacer()
+            if let onReload = onReload {
+                Button(action: onReload) {
+                    Image(systemName: isLoading ? "xmark.circle.fill" : "arrow.clockwise")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundColor(.white)
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 44)
+        .background(Color(red: 0.07, green: 0.07, blue: 0.09))
+    }
+}
+
+// MARK: - 单个网页 Tab
 struct SiteTabView: View {
     let title: String
     let icon: String
@@ -40,24 +88,12 @@ struct SiteTabView: View {
         VStack(spacing: 0) {
             // 顶部 App 栏：网页内容从安全区下方开始，
             // 不再顶进刘海/灵动岛，网站的导航和搜索栏都能正常点按
-            HStack(spacing: 12) {
-                Image(systemName: icon)
-                    .foregroundColor(.pink)
-                Text(title)
-                    .font(.headline)
-                    .foregroundColor(.white)
-                Spacer()
-                Button {
-                    model.webView?.reload()
-                } label: {
-                    Image(systemName: model.isLoading ? "xmark.circle.fill" : "arrow.clockwise")
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundColor(.white)
-                }
-            }
-            .padding(.horizontal, 16)
-            .frame(height: 44)
-            .background(Color(red: 0.07, green: 0.07, blue: 0.09))
+            TabHeader(
+                title: title,
+                icon: icon,
+                onReload: { model.webView?.reload() },
+                isLoading: model.isLoading
+            )
 
             // 页面加载进度条
             if model.isLoading {
@@ -155,12 +191,21 @@ struct WebViewContainer: UIViewRepresentable {
             ]
         }
 
-        // 站外链接交给系统 Safari 打开；站内链接与资源请求正常放行
+        // 站外链接交给系统 Safari；视频/文件直链转交下载管理器；其余放行
         func webView(
             _ webView: WKWebView,
             decidePolicyFor navigationAction: WKNavigationAction,
             decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
         ) {
+            // 点击视频直链（.mp4 等）→ 直接开始下载
+            if navigationAction.navigationType == .linkActivated,
+               let url = navigationAction.request.url,
+               DownloadManager.isDirectMediaURL(url) {
+                decisionHandler(.cancel)
+                DownloadManager.shared.startDownload(from: url, webView: webView)
+                return
+            }
+
             if navigationAction.navigationType == .linkActivated,
                let url = navigationAction.request.url,
                let host = url.host?.lowercased(),
@@ -170,6 +215,25 @@ struct WebViewContainer: UIViewRepresentable {
                     UIApplication.shared.open(url)
                 }
                 return
+            }
+            decisionHandler(.allow)
+        }
+
+        // 服务器返回不可显示的文件（octet-stream / video 等）→ 转交下载
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationResponse: WKNavigationResponse,
+            decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+        ) {
+            let mime = navigationResponse.response.mimeType?.lowercased() ?? ""
+            if navigationResponse.canShowMIMEType == false
+                || mime.contains("video")
+                || mime.contains("octet-stream") {
+                if let url = navigationResponse.response.url {
+                    decisionHandler(.cancel)
+                    DownloadManager.shared.startDownload(from: url, webView: webView)
+                    return
+                }
             }
             decisionHandler(.allow)
         }
