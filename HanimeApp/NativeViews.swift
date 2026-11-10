@@ -1,5 +1,42 @@
 import SwiftUI
 import AVKit
+import UIKit
+
+// MARK: - 诊断信息面板（出问题时展示抓取引擎的实际返回情况）
+struct DiagnosticsView: View {
+    let text: String
+    @State private var expanded = false
+
+    var body: some View {
+        if !text.isEmpty {
+            VStack(spacing: 10) {
+                Button(action: { expanded.toggle() }) {
+                    Label(expanded ? "收起诊断信息" : "查看诊断信息", systemImage: "info.circle")
+                        .font(.footnote)
+                        .foregroundColor(.pink)
+                }
+                if expanded {
+                    Text(text)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.gray)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                        .background(Color(white: 0.12))
+                        .cornerRadius(8)
+                    Button {
+                        UIPasteboard.general.string = text
+                    } label: {
+                        Label("复制诊断信息", systemImage: "doc.on.doc")
+                            .font(.footnote)
+                            .foregroundColor(.pink)
+                    }
+                }
+            }
+            .padding(.horizontal, 20)
+        }
+    }
+}
 
 // MARK: - 视频网格（原生列表页：主页 / 本日排行 / 订阅内容 / 搜索结果）
 struct VideoGridView: View {
@@ -132,6 +169,7 @@ struct VideoGridView: View {
                 Label("重试", systemImage: "arrow.clockwise")
                     .font(.footnote).foregroundColor(.pink)
             }
+            DiagnosticsView(text: SiteAPI.shared.lastDiagnostics)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -404,6 +442,7 @@ struct VideoDetailView: View {
                         .font(.footnote).foregroundColor(.pink)
                 }
                 .frame(maxWidth: .infinity, alignment: .center)
+                DiagnosticsView(text: SiteAPI.shared.lastDiagnostics)
             }
         }
     }
@@ -570,7 +609,7 @@ struct MineView: View {
                     Label("版本", systemImage: "info.circle")
                         .foregroundColor(.white)
                     Spacer()
-                    Text("3.0 全原生版").font(.footnote).foregroundColor(.gray)
+                    Text("3.1 原生版").font(.footnote).foregroundColor(.gray)
                 }
             } header: {
                 Text("关于").font(.footnote).foregroundColor(.gray)

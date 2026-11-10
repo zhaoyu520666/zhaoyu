@@ -61,6 +61,11 @@ final class SiteAPI: ObservableObject {
 
     @Published var isLoggedIn = false
     @Published var checkingLogin = false
+    @Published var lastDiagnostics = ""
+
+    // 列表页特征选择器（页面真实内容已渲染的判定条件）
+    static let listReadySelector = "a[href*=\"watch?v=\"]"
+    static let detailReadySelector = "video, source[src]"
 
     private lazy var session: URLSession = {
         let config = URLSessionConfiguration.default
@@ -86,6 +91,29 @@ final class SiteAPI: ObservableObject {
         return request
     }
 
+    /// 首选：不可见 WebKit 抓取（真实浏览器身份，可过 Cloudflare）；失败时回退 URLSession
+    func loadHTML(_ url: URL, readySelector: String?, completion: @escaping (Result<String, Error>) -> Void) {
+        HTMLFetcher.shared.fetch(url, readySelector: readySelector) { [weak self] result in
+            DispatchQueue.main.async { self?.lastDiagnostics = HTMLFetcher.shared.lastDiagnostics }
+            switch result {
+            case .success(let html) where html.count > 200:
+                completion(.success(html))
+            case .success, .failure:
+                // 兜底：直接网络请求（部分网络下原生请求也能通）
+                self?.getHTML(url) { fallback in
+                    switch fallback {
+                    case .success(let html) where !html.isEmpty:
+                        completion(.success(html))
+                    case .success:
+                        completion(.failure(SiteDataError.empty))
+                    case .failure(let err):
+                        completion(.failure(err))
+                    }
+                }
+            }
+        }
+    }
+
     func getHTML(_ url: URL, referer: String? = nil, completion: @escaping (Result<String, Error>) -> Void) {
         let task = session.dataTask(with: makeRequest(url, referer: referer)) { data, response, error in
             if let error = error as NSError?, error.code == NSURLErrorTimedOut {
@@ -106,7 +134,7 @@ final class SiteAPI: ObservableObject {
 
     // MARK: 列表页
     func fetchList(_ url: URL, completion: @escaping (Result<[VideoItem], Error>) -> Void) {
-        getHTML(url) { result in
+        loadHTML(url, readySelector: Self.listReadySelector) { result in
             switch result {
             case .success(let html):
                 let items = Self.parseCards(html)
@@ -123,7 +151,7 @@ final class SiteAPI: ObservableObject {
 
     // MARK: 详情页
     func fetchDetail(_ url: URL, completion: @escaping (Result<VideoDetail, Error>) -> Void) {
-        getHTML(url) { result in
+        loadHTML(url, readySelector: Self.detailReadySelector) { result in
             switch result {
             case .success(let html):
                 if let detail = Self.parseDetail(html, pageURL: url.absoluteString) {
@@ -137,13 +165,12 @@ final class SiteAPI: ObservableObject {
         }
     }
 
-    // MARK: 登录状态检测（未登录时底部"我的"链接指向 /login）
+    // MARK: 登录状态检测（未登录时底部"我的 Hanime1"链接指向 /login）
     func checkLoginState(completion: @escaping (Bool) -> Void) {
-        getHTML(URL(string: Self.base + "/")!) { [weak self] result in
+        loadHTML(URL(string: Self.base + "/")!, readySelector: nil) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 if case .success(let html) = result {
-                    // 未登录时底部"我的 Hanime1"导航指向 /login，已登录时指向账户页
                     let mineHref = Self.match(pattern: #"<a href="([^"]+)"[^>]*>\s*<img[^>]*>\s*<div[^>]*>\s*我的"#, in: html).first
                     let loggedIn = !(mineHref?.contains("login") ?? true)
                     self.isLoggedIn = loggedIn
@@ -155,74 +182,29 @@ final class SiteAPI: ObservableObject {
         }
     }
 
-    // MARK: 原生登录（GET 拿 CSRF token → POST 表单 → Cookie 自动持久化）
+    // MARK: 原生登录（在抓取引擎内以真实浏览器方式提交表单，Cookie 自动持久化）
     func login(email: String, password: String, completion: @escaping (Result<Void, Error>) -> Void) {
-        guard let loginURL = URL(string: Self.base + "/login") else {
-            completion(.failure(SiteDataError.badResponse)); return
-        }
-        getHTML(loginURL) { [weak self] result in
+        HTMLFetcher.shared.login(email: email, password: password) { [weak self] result in
             guard let self = self else { return }
             switch result {
             case .failure(let err):
                 DispatchQueue.main.async { completion(.failure(err)) }
-            case .success(let html):
-                guard let token = Self.match(pattern: #"name="_token" value="([^"]+)""#, in: html).first else {
-                    DispatchQueue.main.async { completion(.failure(SiteDataError.needToken)) }
-                    return
-                }
-                self.postLogin(loginURL: loginURL, token: token, email: email, password: password, completion: completion)
-            }
-        }
-    }
-
-    private func postLogin(loginURL: URL, token: String, email: String, password: String,
-                           completion: @escaping (Result<Void, Error>) -> Void) {
-        var body = URLComponents()
-        body.queryItems = [
-            URLQueryItem(name: "_token", value: token),
-            URLQueryItem(name: "email", value: email),
-            URLQueryItem(name: "password", value: password)
-        ]
-        var request = makeRequest(loginURL, referer: Self.base + "/login")
-        request.httpMethod = "POST"
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        request.httpBody = body.percentEncodedQuery?.data(using: .utf8)
-
-        let task = session.dataTask(with: request) { [weak self] _, response, error in
-            guard let self = self, error == nil,
-                  let http = response as? HTTPURLResponse else {
-                DispatchQueue.main.async {
-                    completion(.failure(SiteDataError.loginFailed("网络请求失败，请重试")))
-                }
-                return
-            }
-            // 登录成功：Laravel 302 回首页；失败：返回 /login 页面
-            let landedOn = http.url?.absoluteString ?? ""
-            if http.statusCode == 419 {
-                DispatchQueue.main.async {
-                    completion(.failure(SiteDataError.loginFailed("会话过期（419），请重试")))
-                }
-                return
-            }
-            self.checkLoginState { loggedIn in
-                DispatchQueue.main.async {
-                    if loggedIn {
-                        completion(.success(()))
-                    } else {
-                        completion(.failure(SiteDataError.loginFailed("邮箱或密码错误")))
+            case .success:
+                self.checkLoginState { loggedIn in
+                    DispatchQueue.main.async {
+                        if loggedIn {
+                            completion(.success(()))
+                        } else {
+                            completion(.failure(SiteDataError.loginFailed("登录未生效，请重试")))
+                        }
                     }
                 }
             }
-            _ = landedOn
         }
-        task.resume()
     }
 
     func logout() {
-        let storage = HTTPCookieStorage.shared
-        if let cookies = storage.cookies(for: URL(string: Self.base)!) {
-            for cookie in cookies { storage.deleteCookie(cookie) }
-        }
+        HTMLFetcher.shared.clearCookies()
         DispatchQueue.main.async { self.isLoggedIn = false }
     }
 
@@ -236,6 +218,14 @@ final class SiteAPI: ObservableObject {
     ///   <div class="title">标题</div> <div class="subtitle">..</div>
     /// 非视频卡（赞助商广告）链接不含 watch?v=，直接过滤
     static func parseCards(_ html: String) -> [VideoItem] {
+        let primary = parseCardsByContainer(html)
+        if !primary.isEmpty { return primary }
+        // 结构变化兜底：按 watch 链接锚点扫描
+        return parseCardsByAnchors(html)
+    }
+
+    /// 解析器 A：按卡片容器切块（标准结构）
+    static func parseCardsByContainer(_ html: String) -> [VideoItem] {
         var items: [VideoItem] = []
         var seen = Set<String>()
 
@@ -266,6 +256,34 @@ final class SiteAPI: ObservableObject {
             let rawTitle = containerTitle.isEmpty ? divTitle : containerTitle
             let title = decodeEntities(rawTitle)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard title.count >= 2 else { continue }
+
+            seen.insert(url)
+            items.append(VideoItem(title: String(title.prefix(120)), cover: cover, url: url))
+        }
+        return items
+    }
+
+    /// 解析器 B：以 watch 链接为锚点，向前后各扩一段窗口找标题/封面
+    static func parseCardsByAnchors(_ html: String) -> [VideoItem] {
+        var items: [VideoItem] = []
+        var seen = Set<String>()
+        let ns = html as NSString
+
+        for groups in matchGroups(pattern: #"<a[^>]+href="(https://hanime1\.me/watch\?v=\d+)""#, in: html) {
+            guard let url = groups.first, !seen.contains(url) else { continue }
+            guard let anchorRange = html.range(of: url) else { continue }
+            let loc = html.distance(from: html.startIndex, to: anchorRange.lowerBound)
+            let start = max(0, loc - 900)
+            let end = min(ns.length, loc + 4500)
+            guard start < end else { continue }
+            let window = ns.substring(with: NSRange(location: start, length: end - start))
+
+            let cover = match(pattern: #"<img[^>]*(?:data-src|src)="(https://vdownload\.hembed\.com/[^"]+)""#, in: window).first
+                ?? match(pattern: #"<img[^>]*src="([^"]+)""#, in: window).first ?? ""
+            let rawTitle = match(pattern: #"<div[^>]*title="([^"]+)""#, in: window).first
+                ?? match(pattern: #"<div class="title">\s*(.*?)\s*</div>"#, in: window).first ?? ""
+            let title = decodeEntities(rawTitle).trimmingCharacters(in: .whitespacesAndNewlines)
             guard title.count >= 2 else { continue }
 
             seen.insert(url)
