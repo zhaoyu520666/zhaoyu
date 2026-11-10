@@ -1,31 +1,27 @@
 import SwiftUI
 import AVKit
-import WebKit
 
 // MARK: - 视频网格（原生列表页：主页 / 本日排行 / 订阅内容 / 搜索结果）
 struct VideoGridView: View {
     var baseURL: URL
     var allowSearch = false
     var emptyHint: String? = nil
+    var reloadToken: Int = 0
 
-    @ObservedObject private var store = SiteDataStore.shared
     @State private var activeURL: URL
-    @State private var activeBase: URL
     @State private var items: [VideoItem] = []
     @State private var loading = false
     @State private var errorText: String?
     @State private var page = 1
     @State private var hasMore = false
     @State private var query = ""
-    @State private var webFallback: URL?
-    @State private var lastRev = -1
 
-    init(baseURL: URL, allowSearch: Bool = false, emptyHint: String? = nil) {
+    init(baseURL: URL, allowSearch: Bool = false, emptyHint: String? = nil, reloadToken: Int = 0) {
         self.baseURL = baseURL
         self.allowSearch = allowSearch
         self.emptyHint = emptyHint
+        self.reloadToken = reloadToken
         _activeURL = State(initialValue: baseURL)
-        _activeBase = State(initialValue: baseURL)
     }
 
     var body: some View {
@@ -37,31 +33,18 @@ struct VideoGridView: View {
         }
         .onAppear { if items.isEmpty { load(reset: true) } }
         .onChange(of: baseURL) { newBase in
-            // 启动早期导航地址还没解析时可能先用了回退地址，解析完成后自动切换重载
-            let untouched = items.isEmpty || activeURL == activeBase
-            activeBase = newBase
-            guard untouched, newBase != activeURL else { return }
             activeURL = newBase
-            page = 1
             items = []
+            page = 1
             load(reset: true)
         }
-        .onReceive(store.$revision) { rev in
-            guard rev != lastRev else { return }
-            lastRev = rev
-            guard rev > 0 else { return }   // 首次订阅的初始值不算"刷新"
+        .onChange(of: reloadToken) { _ in
             activeURL = baseURL
-            page = 1
             items = []
+            page = 1
             load(reset: true)
         }
         .background(Color(red: 0.07, green: 0.07, blue: 0.09).ignoresSafeArea())
-        .fullScreenCover(item: Binding(
-            get: { webFallback.map { WebFallbackBox(url: $0) } },
-            set: { webFallback = $0?.url }
-        )) { box in
-            WebSheetView(url: box.url)
-        }
     }
 
     // 搜索框
@@ -130,8 +113,8 @@ struct VideoGridView: View {
             Text(emptyHint ?? "这里还没有内容")
                 .font(.footnote)
                 .foregroundColor(.gray)
-            Button(action: { webFallback = activeURL }) {
-                Label("打开网页版查看", systemImage: "safari")
+            Button(action: { load(reset: true) }) {
+                Label("重试", systemImage: "arrow.clockwise")
                     .font(.footnote)
                     .foregroundColor(.pink)
             }
@@ -149,10 +132,6 @@ struct VideoGridView: View {
                 Label("重试", systemImage: "arrow.clockwise")
                     .font(.footnote).foregroundColor(.pink)
             }
-            Button(action: { webFallback = activeURL }) {
-                Label("用网页版打开", systemImage: "safari")
-                    .font(.footnote).foregroundColor(.pink)
-            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -161,8 +140,8 @@ struct VideoGridView: View {
     private func submitSearch() {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { resetToBase(); return }
-        var comps = URLComponents(url: URL(string: "https://hanime1.me/search")!, resolvingAgainstBaseURL: false)!
-        comps.queryItems = [URLQueryItem(name: "v", value: ""), URLQueryItem(name: "query", value: q)]
+        var comps = URLComponents(url: URL(string: SiteAPI.base + "/search")!, resolvingAgainstBaseURL: false)!
+        comps.queryItems = [URLQueryItem(name: "query", value: q)]
         if let u = comps.url {
             activeURL = u
             items = []
@@ -191,7 +170,7 @@ struct VideoGridView: View {
         let target = reset ? activeURL : pageURL(page)
         loading = true
         if reset { errorText = nil }
-        store.fetchList(target) { result in
+        SiteAPI.shared.fetchList(target) { result in
             DispatchQueue.main.async {
                 loading = false
                 switch result {
@@ -207,12 +186,6 @@ struct VideoGridView: View {
             }
         }
     }
-}
-
-// fullScreenCover 的 item 包装
-struct WebFallbackBox: Identifiable {
-    let url: URL
-    var id: URL { url }
 }
 
 // MARK: - 封面图加载（内存缓存 + 降采样解码，避免滚动卡顿）
@@ -303,7 +276,7 @@ struct VideoCardView: View {
     }
 }
 
-// MARK: - 详情页
+// MARK: - 详情页（原生：AVPlayer 直连 MP4，支持下载）
 struct VideoDetailView: View {
     let item: VideoItem
 
@@ -312,7 +285,6 @@ struct VideoDetailView: View {
     @State private var loading = true
     @State private var errorText: String?
     @State private var playerBundle: PlayerBundle?
-    @State private var webFallback = false
 
     var body: some View {
         ScrollView {
@@ -324,7 +296,7 @@ struct VideoDetailView: View {
                     Text(d.desc)
                         .font(.footnote)
                         .foregroundColor(.gray)
-                        .lineLimit(6)
+                        .lineLimit(8)
                 }
                 if let d = detail, !d.tags.isEmpty {
                     flowTags(d.tags)
@@ -350,13 +322,10 @@ struct VideoDetailView: View {
         .fullScreenCover(item: $playerBundle) { bundle in
             PlayerScreen(sources: bundle.sources)
         }
-        .fullScreenCover(isPresented: $webFallback) {
-            WebSheetView(url: item.pageURL ?? SiteDataStore.shared.homeURL)
-        }
     }
 
     private var cover: some View {
-        CachedCoverImage(url: item.coverURL, targetWidth: 800)
+        CachedCoverImage(url: detail?.cover.isEmpty == false ? URL(string: detail!.cover) : item.coverURL, targetWidth: 800)
             .frame(height: 220)
             .frame(maxWidth: .infinity)
             .clipped()
@@ -380,7 +349,7 @@ struct VideoDetailView: View {
         if loading {
             HStack(spacing: 10) {
                 ProgressView().tint(.pink)
-                Text("正在解析播放地址…").font(.footnote).foregroundColor(.gray)
+                Text("正在加载播放地址…").font(.footnote).foregroundColor(.gray)
             }
             .frame(maxWidth: .infinity, alignment: .center)
             .padding(.vertical, 8)
@@ -390,7 +359,7 @@ struct VideoDetailView: View {
                     Button(action: { playerBundle = PlayerBundle(sources: d.sources, current: source) }) {
                         HStack {
                             Image(systemName: "play.fill")
-                            Text(source.label)
+                            Text("播放 \(source.label)")
                             Spacer()
                             Image(systemName: "chevron.right").font(.caption)
                         }
@@ -403,12 +372,27 @@ struct VideoDetailView: View {
                     }
                     .buttonStyle(.plain)
                 }
-                Button(action: { webFallback = true }) {
-                    Label("网页方式播放（备用）", systemImage: "safari")
-                        .font(.footnote)
-                        .foregroundColor(.gray)
+                ForEach(d.sources) { source in
+                    Button(action: {
+                        DownloadManager.shared.startDownload(
+                            from: URL(string: source.url) ?? URL(string: "https://hanime1.me")!,
+                            title: d.title)
+                    }) {
+                        HStack {
+                            Image(systemName: "arrow.down.circle")
+                            Text("下载 \(source.label)")
+                            Spacer()
+                            Image(systemName: "chevron.right").font(.caption)
+                        }
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundColor(.white)
+                        .padding(.vertical, 11)
+                        .padding(.horizontal, 16)
+                        .background(Color(white: 0.16))
+                        .cornerRadius(10)
+                    }
+                    .buttonStyle(.plain)
                 }
-                .frame(maxWidth: .infinity, alignment: .center)
             }
         } else {
             VStack(spacing: 10) {
@@ -417,11 +401,6 @@ struct VideoDetailView: View {
                     .foregroundColor(.gray)
                 Button(action: load) {
                     Label("重试", systemImage: "arrow.clockwise")
-                        .font(.footnote).foregroundColor(.pink)
-                }
-                .frame(maxWidth: .infinity, alignment: .center)
-                Button(action: { webFallback = true }) {
-                    Label("用网页版打开", systemImage: "safari")
                         .font(.footnote).foregroundColor(.pink)
                 }
                 .frame(maxWidth: .infinity, alignment: .center)
@@ -447,7 +426,7 @@ struct VideoDetailView: View {
         guard let url = item.pageURL else { return }
         loading = true
         errorText = nil
-        SiteDataStore.shared.fetchDetail(url) { result in
+        SiteAPI.shared.fetchDetail(url) { result in
             DispatchQueue.main.async {
                 loading = false
                 switch result {
@@ -465,7 +444,7 @@ struct PlayerBundle: Identifiable {
     var id = UUID()
 }
 
-// MARK: - 原生播放器（AVPlayer，支持 HLS / 手势 / 画中画）
+// MARK: - 原生播放器（AVPlayer 直连，支持画质切换 / 画中画）
 struct PlayerScreen: View {
     let sources: [VideoSource]
 
@@ -523,7 +502,7 @@ struct NativePlayerAV: UIViewControllerRepresentable {
         if let url = URL(string: urlString) {
             let headers = [
                 "Referer": "https://hanime1.me/",
-                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+                "User-Agent": SiteAPI.mobileUA
             ]
             let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
             let player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
@@ -537,33 +516,53 @@ struct NativePlayerAV: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {}
 }
 
-// MARK: - 我的
+// MARK: - 我的（原生账户页 + 原生登录表单，全程不跳网页）
 struct MineView: View {
-    var onLogin: () -> Void
+    @ObservedObject private var api = SiteAPI.shared
     var onDownloads: () -> Void
+
+    @State private var email = ""
+    @State private var password = ""
+    @State private var loggingIn = false
+    @State private var loginError: String?
+    @State private var showPassword = false
 
     var body: some View {
         List {
             Section {
-                Button(action: onLogin) {
-                    Label("登录 / 我的账户", systemImage: "person.crop.circle")
-                        .foregroundColor(.white)
-                }
-                Button(action: onDownloads) {
-                    Label("下载管理", systemImage: "arrow.down.circle")
-                        .foregroundColor(.white)
+                if api.checkingLogin {
+                    HStack {
+                        ProgressView().tint(.pink)
+                        Text("正在检测登录状态…").font(.footnote).foregroundColor(.gray)
+                    }
+                } else if api.isLoggedIn {
+                    HStack(spacing: 12) {
+                        Image(systemName: "person.crop.circle.fill")
+                            .font(.system(size: 30))
+                            .foregroundColor(.pink)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("已登录").font(.headline).foregroundColor(.white)
+                            Text("账号数据已同步").font(.footnote).foregroundColor(.gray)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                    Button(role: .destructive, action: { api.logout() }) {
+                        Label("退出登录", systemImage: "rectangle.portrait.and.arrow.right")
+                    }
+                } else {
+                    loginForm
                 }
             } header: {
                 Text("账户").font(.footnote).foregroundColor(.gray)
             }
 
             Section {
-                Button(action: onLogin) {
-                    Label("追番列表（登录后同步）", systemImage: "heart")
+                Button(action: onDownloads) {
+                    Label("下载管理", systemImage: "arrow.down.circle")
                         .foregroundColor(.white)
                 }
             } header: {
-                Text("收藏").font(.footnote).foregroundColor(.gray)
+                Text("内容").font(.footnote).foregroundColor(.gray)
             }
 
             Section {
@@ -571,12 +570,101 @@ struct MineView: View {
                     Label("版本", systemImage: "info.circle")
                         .foregroundColor(.white)
                     Spacer()
-                    Text("2.0 原生版").font(.footnote).foregroundColor(.gray)
+                    Text("3.0 全原生版").font(.footnote).foregroundColor(.gray)
                 }
             } header: {
                 Text("关于").font(.footnote).foregroundColor(.gray)
             }
         }
         .listStyle(.insetGrouped)
+        .onAppear {
+            api.checkingLogin = true
+            api.checkLoginState { _ in
+                DispatchQueue.main.async { api.checkingLogin = false }
+            }
+        }
+    }
+
+    // 原生登录表单
+    private var loginForm: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("登录 Hanime1 账号")
+                .font(.headline)
+                .foregroundColor(.white)
+
+            TextField("邮箱地址", text: $email)
+                .keyboardType(.emailAddress)
+                .autocapitalization(.none)
+                .disableAutocorrection(true)
+                .foregroundColor(.white)
+                .padding(10)
+                .background(Color(white: 0.14))
+                .cornerRadius(8)
+
+            HStack {
+                Group {
+                    if showPassword {
+                        TextField("密码", text: $password)
+                    } else {
+                        SecureField("密码", text: $password)
+                    }
+                }
+                .foregroundColor(.white)
+                .autocapitalization(.none)
+                .disableAutocorrection(true)
+
+                Button(action: { showPassword.toggle() }) {
+                    Image(systemName: showPassword ? "eye.slash" : "eye")
+                        .foregroundColor(.gray)
+                        .font(.system(size: 14))
+                }
+            }
+            .padding(10)
+            .background(Color(white: 0.14))
+            .cornerRadius(8)
+
+            if let err = loginError {
+                Text(err)
+                    .font(.footnote)
+                    .foregroundColor(.red)
+            }
+
+            Button(action: doLogin) {
+                HStack {
+                    if loggingIn {
+                        ProgressView().tint(.white)
+                    } else {
+                        Image(systemName: "person.crop.circle.badge.checkmark")
+                    }
+                    Text(loggingIn ? "正在登录…" : "登录")
+                        .font(.system(size: 15, weight: .semibold))
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .background(email.isEmpty || password.isEmpty ? Color(red: 0.96, green: 0.44, blue: 0.55).opacity(0.4) : Color(red: 0.96, green: 0.44, blue: 0.55))
+                .cornerRadius(10)
+            }
+            .buttonStyle(.plain)
+            .disabled(loggingIn || email.isEmpty || password.isEmpty)
+        }
+        .padding(.vertical, 6)
+    }
+
+    private func doLogin() {
+        loggingIn = true
+        loginError = nil
+        SiteAPI.shared.login(email: email, password: password) { result in
+            DispatchQueue.main.async {
+                loggingIn = false
+                switch result {
+                case .success:
+                    api.isLoggedIn = true
+                    password = ""
+                case .failure(let err):
+                    loginError = err.localizedDescription
+                }
+            }
+        }
     }
 }

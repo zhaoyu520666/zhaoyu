@@ -1,6 +1,5 @@
 import SwiftUI
 import AVKit
-import WebKit
 
 // MARK: - 下载条目
 struct DownloadItem: Identifiable {
@@ -70,19 +69,11 @@ final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDeleg
         return ["mp4", "webm", "mov", "m4v", "mkv", "avi", "ts"].contains(ext)
     }
 
-    /// 开始下载（先把 WebView 的登录 Cookie 同步给 URLSession）
+    /// 开始下载
     /// - Parameter title: 视频标题，用来给文件命名
-    func startDownload(from url: URL, webView: WKWebView? = nil, title: String? = nil) {
+    func startDownload(from url: URL, title: String? = nil) {
         let fileName = makeFileName(title: title, url: url)
-        func begin() { self.beginDownload(from: url, fileName: fileName) }
-        if let store = webView?.configuration.websiteDataStore.httpCookieStore {
-            store.getAllCookies { cookies in
-                for c in cookies { HTTPCookieStorage.shared.setCookie(c) }
-                DispatchQueue.main.async(execute: begin)
-            }
-        } else {
-            DispatchQueue.main.async(execute: begin)
-        }
+        beginDownload(from: url, fileName: fileName)
     }
 
     private func beginDownload(from url: URL, fileName: String) {

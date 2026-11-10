@@ -1,14 +1,12 @@
 import SwiftUI
-import WebKit
 
-// MARK: - 主界面（原生 App 外壳：底部导航 + 原生页面）
+// MARK: - 主界面（3.0 全原生：底部导航 + 纯 URLSession 数据，无任何 WebView）
 struct ContentView: View {
-    @StateObject private var store = SiteDataStore.shared
     @StateObject private var downloads = DownloadManager.shared
 
     @State private var tab = 0
     @State private var showDownloads = false
-    @State private var showLogin = false
+    @State private var reloadToken = 0
 
     private let tabTitles = ["主页", "本日排行", "订阅内容", "我的"]
     private let tabIcons = ["house.fill", "rectangle.stack.fill", "play.rectangle.fill", "person.crop.square.fill"]
@@ -19,9 +17,7 @@ struct ContentView: View {
                 TabHeader(
                     title: tabTitles[tab],
                     icon: tabIcons[tab],
-                    onReload: {
-                        store.clearCache()
-                    },
+                    onReload: { reloadToken += 1 },
                     extraIcon: "arrow.down.circle",
                     onExtra: { showDownloads = true }
                 )
@@ -29,19 +25,18 @@ struct ContentView: View {
                 Group {
                     switch tab {
                     case 0:
-                        VideoGridView(baseURL: store.homeURL, allowSearch: true)
+                        VideoGridView(baseURL: URL(string: SiteAPI.base + "/")!, allowSearch: true, reloadToken: reloadToken)
                     case 1:
-                        VideoGridView(baseURL: store.rankURL)
+                        // 本日排行 = 搜索页带排序参数
+                        VideoGridView(baseURL: rankURL, reloadToken: reloadToken)
                     case 2:
                         VideoGridView(
-                            baseURL: store.subsURL,
-                            emptyHint: "订阅内容需要先登录（到「我的」→ 登录后重试）"
+                            baseURL: URL(string: SiteAPI.base + "/subscriptions")!,
+                            emptyHint: "订阅内容需要先登录（到「我的」登录后再刷新）",
+                            reloadToken: reloadToken
                         )
                     default:
-                        MineView(
-                            onLogin: { showLogin = true },
-                            onDownloads: { showDownloads = true }
-                        )
+                        MineView(onDownloads: { showDownloads = true })
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -69,12 +64,12 @@ struct ContentView: View {
         .fullScreenCover(isPresented: $showDownloads) {
             DownloadsTabView(onClose: { showDownloads = false })
         }
-        .fullScreenCover(isPresented: $showLogin) {
-            WebSheetView(url: store.homeURL)
-        }
-        .onAppear {
-            store.activate()   // 启动数据引擎（隐藏 WebView 抓取导航地址）
-        }
+    }
+
+    private var rankURL: URL {
+        var comps = URLComponents(url: URL(string: SiteAPI.base + "/search")!, resolvingAgainstBaseURL: false)!
+        comps.queryItems = [URLQueryItem(name: "sort", value: "本日排行")]
+        return comps.url!
     }
 }
 
