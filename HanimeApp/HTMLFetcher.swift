@@ -72,19 +72,56 @@ final class HTMLFetcher: NSObject, WKNavigationDelegate {
                             completion(.failure(SiteDataError.loginFailed("登录表单结构变化，请反馈")))
                             return
                         }
-                        // 提交后等 3 秒看落点 URL：还在 /login 说明失败
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
-                            self.webView?.evaluateJavaScript("location.href") { href, _ in
-                                let h = (href as? String) ?? ""
-                                if h.contains("/login") || h.isEmpty {
-                                    completion(.failure(SiteDataError.loginFailed("邮箱或密码错误")))
-                                } else {
-                                    completion(.success(()))
-                                }
-                            }
-                        }
+                        // 提交后轮询落点：跳离 /login = 成功；稳定停在 /login 且带错误提示 = 真实失败
+                        self.pollLoginResult(since: Date(), completion: completion)
                     }
                 }
+            }
+        }
+    }
+
+    /// 登录提交后轮询结果（不再用固定 3 秒，避免慢网络下误判）
+    private func pollLoginResult(since start: Date, completion: @escaping (Result<Void, Error>) -> Void) {
+        let js = """
+        (function(){
+          var errEl = document.querySelector('.alert-danger, .alert, [role="alert"], .error-message, .invalid-feedback');
+          return JSON.stringify({
+            url: location.href || '',
+            ready: document.readyState || '',
+            hasForm: !!document.querySelector('input[name="email"]'),
+            err: errEl ? (errEl.innerText || '').replace(/\\s+/g,' ').trim().slice(0, 140) : ''
+          });
+        })();
+        """
+        webView?.evaluateJavaScript(js) { [weak self] value, _ in
+            guard let self = self else { return }
+            var url = "", ready = "", err = ""
+            var hasForm = false
+            if let s = value as? String, let d = s.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: d),
+               let info = obj as? [String: Any] {
+                url = info["url"] as? String ?? ""
+                ready = info["ready"] as? String ?? ""
+                hasForm = info["hasForm"] as? Bool ?? false
+                err = info["err"] as? String ?? ""
+            }
+            let elapsed = Date().timeIntervalSince(start)
+            let onLoginPage = url.contains("/login")
+
+            // 成功：已跳离登录页且文档加载完成
+            if !onLoginPage && ready == "complete" && elapsed > 1.0 {
+                completion(.success(())); return
+            }
+            // 确定失败：稳定停在登录页，表单还在，且已给足跳转时间
+            if onLoginPage && ready == "complete" && hasForm && elapsed > 6 {
+                let msg = err.isEmpty ? "邮箱或密码错误" : err
+                completion(.failure(SiteDataError.loginFailed(msg))); return
+            }
+            if elapsed > 20 {
+                completion(.failure(SiteDataError.loginFailed("登录响应超时，请重试"))); return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+                self.pollLoginResult(since: start, completion: completion)
             }
         }
     }

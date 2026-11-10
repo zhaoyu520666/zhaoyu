@@ -609,7 +609,7 @@ struct MineView: View {
                     Label("版本", systemImage: "info.circle")
                         .foregroundColor(.white)
                     Spacer()
-                    Text("3.1 原生版").font(.footnote).foregroundColor(.gray)
+                    Text("3.2 原生版").font(.footnote).foregroundColor(.gray)
                 }
             } header: {
                 Text("关于").font(.footnote).foregroundColor(.gray)
