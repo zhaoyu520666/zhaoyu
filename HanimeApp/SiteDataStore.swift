@@ -524,7 +524,7 @@ extension SiteDataStore: WKNavigationDelegate {
                 }
                 // ok:false 可能是内容还没渲染好 / 播放器还没拉流，多等几轮（同时等媒体请求回传）
                 let looksEmpty = json.contains("\"ok\":false")
-                if looksEmpty && attempt < 5 && capturedSources.isEmpty {
+                if looksEmpty && attempt < 5 && self.capturedSources.isEmpty {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
                         guard let self = self, self.current != nil else { return }
                         self.extract(pending, in: webView, attempt: attempt + 1)
