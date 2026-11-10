@@ -57,6 +57,14 @@ enum Extractors {
     static let list: String = ##"""
     (function () {
       function clean(s) { return (s || "").replace(/\s+/g, " ").trim(); }
+      function tidy(t) {
+        return (t || "")
+          .replace(/^\s*\d{1,2}:\d{2}\s*/, "")
+          .replace(/thumb_up|thumb_down/gi, " ")
+          .replace(/\d+(\.\d+)?%/g, " ")
+          .replace(/\d+(\.\d+)?万次/g, " ")
+          .replace(/\s+/g, " ").trim();
+      }
       function find(label) {
         var all = document.querySelectorAll("a, button, li, div, span");
         var best = null, bl = 999, bw = 1e9;
@@ -83,9 +91,9 @@ enum Extractors {
         if (hrefAttr.indexOf("watch?v=") === -1 || seen[hrefAttr]) { continue; }
         var card = a.closest("div") || a;
         var img = a.querySelector("img") || card.querySelector("img");
-        var title = clean((img && (img.alt || img.title)) || "");
-        if (!title) { title = clean(a.innerText); }
-        if (!title) { title = clean(card.innerText).slice(0, 60); }
+        var title = tidy(clean((img && (img.alt || img.title)) || ""));
+        if (!title) { title = tidy(clean(a.innerText)); }
+        if (!title) { title = tidy(clean(card.innerText)).slice(0, 60); }
         var cover = img ? (img.getAttribute("src") || img.getAttribute("data-src") || img.getAttribute("data-original") || "") : "";
         if (cover.indexOf("//") === 0) { cover = "https:" + cover; }
         if (!title || title.length < 2) { continue; }
@@ -110,9 +118,17 @@ enum Extractors {
         var el = document.querySelector('meta[property="' + name + '"], meta[name="' + name + '"]');
         return el ? clean(el.getAttribute("content")) : "";
       }
+      function tidy(t) {
+        return (t || "")
+          .replace(/^\s*\d{1,2}:\d{2}\s*/, "")
+          .replace(/thumb_up|thumb_down/gi, " ")
+          .replace(/\d+(\.\d+)?%/g, " ")
+          .replace(/\d+(\.\d+)?万次/g, " ")
+          .replace(/\s+/g, " ").trim();
+      }
       function meta() {
         var h1 = document.querySelector("h1");
-        var title = clean((h1 && h1.innerText) || "") || og("og:title") || clean(document.title);
+        var title = tidy(clean((h1 && h1.innerText) || "") || og("og:title") || clean(document.title));
         var tags = [];
         var tagAs = document.querySelectorAll('a[href*="search?query="], a[href*="genre"], .genre a, .tags a, .tag');
         for (var j = 0; j < tagAs.length && tags.length < 12; j++) {
@@ -162,6 +178,58 @@ enum Extractors {
       });
     })();
     """##
+
+    /// 媒体请求监听：在页面 DOC 开始时注入（含 iframe），
+    /// 拦截 XHR/fetch/video 实际请求的 m3u8·mp4 地址，回传给原生层。
+    /// 这是最可靠的取流方式——不依赖播放器把地址写在 HTML 里。
+    static let mediaCapture: String = ##"""
+    (function () {
+      if (window.__hnHooked) { return; }
+      window.__hnHooked = 1;
+      function abs(u) {
+        if (!u) { return ""; }
+        if (u.indexOf("//") === 0) { return "https:" + u; }
+        if (u.charAt(0) === "/") { return location.origin + u; }
+        return u;
+      }
+      function send(u) {
+        try {
+          var s = abs(String(u || ""));
+          if (!/m3u8|mp4/i.test(s)) { return; }
+          if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.hnMedia) {
+            window.webkit.messageHandlers.hnMedia.postMessage({ url: s });
+          }
+        } catch (e) {}
+      }
+      try {
+        var originalOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function (method, url) {
+          try { send(url); } catch (e) {}
+          return originalOpen.apply(this, arguments);
+        };
+      } catch (e) {}
+      try {
+        if (window.fetch) {
+          var originalFetch = window.fetch;
+          window.fetch = function (input) {
+            try { send(typeof input === "string" ? input : (input && input.url)); } catch (e) {}
+            return originalFetch.apply(this, arguments);
+          };
+        }
+      } catch (e) {}
+      function scan() {
+        try {
+          var nodes = document.querySelectorAll("video, source, a[href*='.mp4'], a[href*='.m3u8']");
+          for (var i = 0; i < nodes.length; i++) {
+            var v = nodes[i];
+            send(v.src || v.getAttribute("src") || v.getAttribute("href") || "");
+          }
+        } catch (e) {}
+      }
+      scan();
+      setInterval(scan, 1500);
+    })();
+    """##
 }
 
 // MARK: - 数据引擎（隐藏 WebView + 串行队列 + 缓存）
@@ -176,6 +244,14 @@ final class SiteDataStore: NSObject, ObservableObject {
     private var busy = false
     private var cache: [String: (date: Date, payload: String)] = [:]
     private var appliedBlockRules = false
+    /// 页面实际请求到的媒体地址（由注入脚本回传），按页面累积
+    private var capturedSources: [String] = []
+
+    private func takeCaptured() -> [String] {
+        let list = capturedSources
+        capturedSources = []
+        return list
+    }
 
     private struct PendingFetch {
         let url: URL
@@ -198,7 +274,7 @@ final class SiteDataStore: NSObject, ObservableObject {
     private static func compileBlockRules() {
         guard blockRules == nil else { return }
         let json = """
-        [{"trigger":{"url-filter":".*","resource-type":["image","stylesheet","font","media"]},"action":{"type":"block"}}]
+        [{"trigger":{"url-filter":".*","resource-type":["image","stylesheet","font"]},"action":{"type":"block"}}]
         """
         WKContentRuleListStore.default().compileContentRuleList(
             forIdentifier: "data-light",
@@ -257,15 +333,20 @@ final class SiteDataStore: NSObject, ObservableObject {
     }
 
     func fetchDetail(_ url: URL, completion: @escaping (Result<VideoDetail, Error>) -> Void) {
-        run(url, name: "watch", extractor: Extractors.watch) { result in
+        run(url, name: "watch", extractor: Extractors.watch) { [weak self] result in
             switch result {
             case .success(let json):
                 guard let data = json.data(using: .utf8),
                       let payload = try? JSONDecoder().decode(WatchPayload.self, from: data) else {
                     completion(.failure(SiteDataError.badResponse)); return
                 }
+                // 合并「页面实际请求到的媒体地址」（最可靠的来源）与 HTML 里扫到的地址
+                var merged = payload.sources
+                if let captured = self?.takeCaptured(), !captured.isEmpty {
+                    merged.append(contentsOf: captured)
+                }
                 // m3u8（自适应流，AVPlayer 直接支持）排前面；mp4 按清晰度数字从高到低
-                let sorted = payload.sources.sorted { a, b in
+                let sorted = merged.sorted { a, b in
                     let aHLS = a.contains(".m3u8"), bHLS = b.contains(".m3u8")
                     if aHLS != bHLS { return aHLS }
                     func res(_ s: String) -> Int {
@@ -309,6 +390,15 @@ final class SiteDataStore: NSObject, ObservableObject {
         guard webView == nil else { return }
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()   // 与登录页共享 Cookie
+        config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = []   // 让播放器能自动初始化拉流
+        let controller = config.userContentController
+        controller.add(self, name: "hnMedia")
+        controller.addUserScript(WKUserScript(
+            source: Extractors.mediaCapture,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        ))
         let wv = WKWebView(frame: CGRect(x: -400, y: -400, width: 400, height: 900), configuration: config)
         wv.navigationDelegate = self
         webView = wv
@@ -340,6 +430,7 @@ final class SiteDataStore: NSObject, ObservableObject {
         busy = true
         queue.removeFirst()
         current = next
+        capturedSources = []   // 每个页面只保留自己抓到的媒体地址
         applyBlockRulesIfNeeded()
         wv.stopLoading()
         wv.load(URLRequest(url: next.url, timeoutInterval: 30))
@@ -431,10 +522,10 @@ extension SiteDataStore: WKNavigationDelegate {
                     self.finish(.failure(SiteDataError.empty))
                     return
                 }
-                // ok:false 可能是内容还没渲染好，重试一次
+                // ok:false 可能是内容还没渲染好 / 播放器还没拉流，多等几轮（同时等媒体请求回传）
                 let looksEmpty = json.contains("\"ok\":false")
-                if looksEmpty && attempt < 1 {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                if looksEmpty && attempt < 5 && capturedSources.isEmpty {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
                         guard let self = self, self.current != nil else { return }
                         self.extract(pending, in: webView, attempt: attempt + 1)
                     }
@@ -443,5 +534,19 @@ extension SiteDataStore: WKNavigationDelegate {
                 self.finish(.success(json))
             }
         }
+    }
+}
+
+// MARK: - 媒体请求回传（注入脚本 → 原生层）
+extension SiteDataStore: WKScriptMessageHandler {
+    func userContentController(_ userContentController: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        guard message.name == "hnMedia",
+              let body = message.body as? [String: Any],
+              let url = body["url"] as? String,
+              !url.isEmpty,
+              !capturedSources.contains(url) else { return }
+        capturedSources.append(url)
+        if capturedSources.count > 40 { capturedSources.removeFirst() }
     }
 }

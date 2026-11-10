@@ -307,6 +307,7 @@ struct VideoCardView: View {
 struct VideoDetailView: View {
     let item: VideoItem
 
+    @Environment(\.dismiss) private var dismiss
     @State private var detail: VideoDetail?
     @State private var loading = true
     @State private var errorText: String?
@@ -334,6 +335,17 @@ struct VideoDetailView: View {
         .background(Color(red: 0.07, green: 0.07, blue: 0.09).ignoresSafeArea())
         .navigationTitle("")
         .navigationBarHidden(true)
+        .overlay(alignment: .topLeading) {
+            Button(action: { dismiss() }) {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundColor(.white)
+                    .frame(width: 36, height: 36)
+                    .background(.ultraThinMaterial, in: Circle())
+            }
+            .padding(.leading, 14)
+            .padding(.top, 8)
+        }
         .onAppear { load() }
         .fullScreenCover(item: $playerBundle) { bundle in
             PlayerScreen(sources: bundle.sources)
