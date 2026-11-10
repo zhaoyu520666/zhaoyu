@@ -10,6 +10,7 @@ struct VideoGridView: View {
 
     @ObservedObject private var store = SiteDataStore.shared
     @State private var activeURL: URL
+    @State private var activeBase: URL
     @State private var items: [VideoItem] = []
     @State private var loading = false
     @State private var errorText: String?
@@ -24,6 +25,7 @@ struct VideoGridView: View {
         self.allowSearch = allowSearch
         self.emptyHint = emptyHint
         _activeURL = State(initialValue: baseURL)
+        _activeBase = State(initialValue: baseURL)
     }
 
     var body: some View {
@@ -34,6 +36,16 @@ struct VideoGridView: View {
             content
         }
         .onAppear { if items.isEmpty { load(reset: true) } }
+        .onChange(of: baseURL) { newBase in
+            // 启动早期导航地址还没解析时可能先用了回退地址，解析完成后自动切换重载
+            let untouched = items.isEmpty || activeURL == activeBase
+            activeBase = newBase
+            guard untouched, newBase != activeURL else { return }
+            activeURL = newBase
+            page = 1
+            items = []
+            load(reset: true)
+        }
         .onReceive(store.$revision) { rev in
             guard rev != lastRev else { return }
             lastRev = rev
@@ -203,6 +215,70 @@ struct WebFallbackBox: Identifiable {
     var id: URL { url }
 }
 
+// MARK: - 封面图加载（内存缓存 + 降采样解码，避免滚动卡顿）
+final class ThumbCache {
+    static let shared = NSCache<NSString, UIImage>()
+}
+
+struct CachedCoverImage: View {
+    let url: URL?
+    var targetWidth: CGFloat = 400
+
+    @State private var image: UIImage?
+    @State private var failed = false
+    @State private var task: URLSessionTask?
+
+    var body: some View {
+        ZStack {
+            Color(white: 0.13)
+            if let image = image {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else if failed {
+                Image(systemName: "photo").foregroundColor(.gray)
+            } else {
+                ProgressView().tint(.pink)
+            }
+        }
+        .onAppear { load() }
+        .onDisappear { task?.cancel() }
+    }
+
+    private func load() {
+        guard let url = url else { failed = true; return }
+        let key = url.absoluteString as NSString
+        if let hit = ThumbCache.shared.object(forKey: key) {
+            image = hit
+            failed = false
+            return
+        }
+        let maxPixel = targetWidth * UIScreen.main.scale
+        task = URLSession.shared.dataTask(with: url) { data, _, _ in
+            guard let data = data, let thumb = Self.downsampled(data: data, maxPixel: maxPixel) else {
+                DispatchQueue.main.async { failed = true }
+                return
+            }
+            ThumbCache.shared.setObject(thumb, forKey: key)
+            DispatchQueue.main.async { image = thumb; failed = false }
+        }
+        task?.resume()
+    }
+
+    /// 用 ImageIO 直接解码缩略图，不把整张原图读进内存
+    private static func downsampled(data: Data, maxPixel: CGFloat) -> UIImage? {
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel
+        ]
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil),
+              let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, options as CFDictionary) else { return nil }
+        return UIImage(cgImage: cg)
+    }
+}
+
 // MARK: - 视频卡片
 struct VideoCardView: View {
     let item: VideoItem
@@ -210,27 +286,11 @@ struct VideoCardView: View {
     var body: some View {
         NavigationLink(destination: VideoDetailView(item: item)) {
             VStack(alignment: .leading, spacing: 6) {
-                ZStack {
-                    Color(white: 0.13)
-                    if let url = item.coverURL {
-                        AsyncImage(url: url) { phase in
-                            switch phase {
-                            case .success(let image):
-                                image.resizable().aspectRatio(contentMode: .fill)
-                            case .failure:
-                                Image(systemName: "photo").foregroundColor(.gray)
-                            default:
-                                ProgressView().tint(.pink)
-                            }
-                        }
-                    } else {
-                        Image(systemName: "photo").foregroundColor(.gray)
-                    }
-                }
-                .frame(height: 104)
-                .frame(maxWidth: .infinity)
-                .clipped()
-                .cornerRadius(8)
+                CachedCoverImage(url: item.coverURL, targetWidth: 360)
+                    .frame(height: 104)
+                    .frame(maxWidth: .infinity)
+                    .clipped()
+                    .cornerRadius(8)
 
                 Text(item.title)
                     .font(.system(size: 12, weight: .medium))
@@ -284,24 +344,11 @@ struct VideoDetailView: View {
     }
 
     private var cover: some View {
-        ZStack {
-            Color(white: 0.13)
-            if let url = item.coverURL {
-                AsyncImage(url: url) { phase in
-                    switch phase {
-                    case .success(let image): image.resizable().aspectRatio(contentMode: .fill)
-                    case .failure: Image(systemName: "photo").foregroundColor(.gray)
-                    default: ProgressView().tint(.pink)
-                    }
-                }
-            } else {
-                Image(systemName: "photo").foregroundColor(.gray)
-            }
-        }
-        .frame(height: 220)
-        .frame(maxWidth: .infinity)
-        .clipped()
-        .cornerRadius(10)
+        CachedCoverImage(url: item.coverURL, targetWidth: 800)
+            .frame(height: 220)
+            .frame(maxWidth: .infinity)
+            .clipped()
+            .cornerRadius(10)
     }
 
     private var info: some View {

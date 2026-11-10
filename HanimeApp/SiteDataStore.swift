@@ -53,17 +53,34 @@ enum SiteDataError: LocalizedError {
 // MARK: - 注入网页的数据提取脚本
 enum Extractors {
 
-    /// 列表页：抓取所有 /watch?v= 卡片（标题 + 封面）
+    /// 列表页：抓取所有 /watch?v= 卡片 + 顺带提取网站底部导航真实地址（一次页面加载拿全部数据）
     static let list: String = ##"""
     (function () {
       function clean(s) { return (s || "").replace(/\s+/g, " ").trim(); }
+      function find(label) {
+        var all = document.querySelectorAll("a, button, li, div, span");
+        var best = null, bl = 999, bw = 1e9;
+        for (var i = 0; i < all.length; i++) {
+          var t = (all[i].innerText || "").replace(/\s+/g, " ").trim();
+          if (!t || t.length > 14 || t.indexOf(label) === -1) { continue; }
+          var w = all[i].getBoundingClientRect().width;
+          if (t.length < bl || (t.length === bl && w < bw)) { best = all[i]; bl = t.length; bw = w; }
+        }
+        return best;
+      }
+      function href(label) {
+        var el = find(label);
+        var a = el && el.closest ? el.closest("a") : null;
+        return (a && a.href) ? a.href : "";
+      }
+      var nav = { home: href("主页"), rank: href("本日排行"), subs: href("订阅内容"), mine: href("我的") };
       var items = [], seen = {};
       var anchors = document.querySelectorAll('a[href*="watch?v="]');
       for (var i = 0; i < anchors.length; i++) {
         var a = anchors[i];
-        var href = a.href || a.getAttribute("href") || "";
-        if (href.charAt(0) === "/") { href = location.origin + href; }
-        if (href.indexOf("watch?v=") === -1 || seen[href]) { continue; }
+        var hrefAttr = a.href || a.getAttribute("href") || "";
+        if (hrefAttr.charAt(0) === "/") { hrefAttr = location.origin + hrefAttr; }
+        if (hrefAttr.indexOf("watch?v=") === -1 || seen[hrefAttr]) { continue; }
         var card = a.closest("div") || a;
         var img = a.querySelector("img") || card.querySelector("img");
         var title = clean((img && (img.alt || img.title)) || "");
@@ -72,11 +89,11 @@ enum Extractors {
         var cover = img ? (img.getAttribute("src") || img.getAttribute("data-src") || img.getAttribute("data-original") || "") : "";
         if (cover.indexOf("//") === 0) { cover = "https:" + cover; }
         if (!title || title.length < 2) { continue; }
-        seen[href] = 1;
-        items.push({ title: title.slice(0, 100), cover: cover, url: href });
+        seen[hrefAttr] = 1;
+        items.push({ title: title.slice(0, 100), cover: cover, url: hrefAttr });
         if (items.length >= 80) { break; }
       }
-      return JSON.stringify({ ok: items.length > 0, items: items });
+      return JSON.stringify({ ok: items.length > 0, items: items, nav: nav });
     })();
     """##
 
@@ -112,29 +129,6 @@ enum Extractors {
       });
     })();
     """##
-
-    /// 网站自带底部导航的真实跳转地址
-    static let nav: String = ##"""
-    (function () {
-      function find(label) {
-        var all = document.querySelectorAll("a, button, li, div, span");
-        var best = null, bl = 999, bw = 1e9;
-        for (var i = 0; i < all.length; i++) {
-          var t = (all[i].innerText || "").replace(/\s+/g, " ").trim();
-          if (!t || t.length > 14 || t.indexOf(label) === -1) { continue; }
-          var w = all[i].getBoundingClientRect().width;
-          if (t.length < bl || (t.length === bl && w < bw)) { best = all[i]; bl = t.length; bw = w; }
-        }
-        return best;
-      }
-      function href(label) {
-        var el = find(label);
-        var a = el && el.closest ? el.closest("a") : null;
-        return (a && a.href) ? a.href : "";
-      }
-      return JSON.stringify({ home: href("主页"), rank: href("本日排行"), subs: href("订阅内容"), mine: href("我的") });
-    })();
-    """##
 }
 
 // MARK: - 数据引擎（隐藏 WebView + 串行队列 + 缓存）
@@ -148,6 +142,7 @@ final class SiteDataStore: NSObject, ObservableObject {
     private var queue: [PendingFetch] = []
     private var busy = false
     private var cache: [String: (date: Date, payload: String)] = [:]
+    private var appliedBlockRules = false
 
     private struct PendingFetch {
         let url: URL
@@ -165,25 +160,33 @@ final class SiteDataStore: NSObject, ObservableObject {
         return u
     }
 
+    // MARK: 轻量加载规则：隐藏 WebView 只需要 HTML DOM，图片/样式/字体/媒体一律拦截
+    private static var blockRules: WKContentRuleList?
+    private static func compileBlockRules() {
+        guard blockRules == nil else { return }
+        let json = """
+        [{"trigger":{"url-filter":".*","resource-type":["image","stylesheet","font","media"]},"action":{"type":"block"}}]
+        """
+        WKContentRuleListStore.default().compileContentRuleList(
+            forIdentifier: "data-light",
+            encodedContentRuleList: json
+        ) { list, _ in
+            blockRules = list
+        }
+    }
+
+    private func applyBlockRulesIfNeeded() {
+        guard !appliedBlockRules, let rules = Self.blockRules, let wv = webView else { return }
+        wv.configuration.userContentController.add(rules)
+        appliedBlockRules = true
+    }
+
     // MARK: 对外接口
 
-    /// 启动：建隐藏 WebView + 抓一次首页拿导航真实地址
+    /// 启动：编译轻量规则 + 就绪隐藏 WebView（导航地址随首次列表页一并取出）
     func activate() {
+        Self.compileBlockRules()
         ensureWebView()
-        run(homeURL, name: "nav", extractor: Extractors.nav, skipCache: true) { [weak self] result in
-            guard let self = self else { return }
-            if case .success(let json) = result,
-               let data = json.data(using: .utf8),
-               let payload = try? JSONDecoder().decode(NavPayload.self, from: data) {
-                var links: [String: String] = [:]
-                if let s = payload.home, !s.isEmpty { links["home"] = s }
-                if let s = payload.rank, !s.isEmpty { links["rank"] = s }
-                if let s = payload.subs, !s.isEmpty { links["subs"] = s }
-                if let s = payload.mine, !s.isEmpty { links["mine"] = s }
-                self.navLinks = links
-                self.objectWillChange.send()   // 让 rankURL/subsURL 重新求值
-            }
-        }
     }
 
     func clearCache() {
@@ -192,12 +195,25 @@ final class SiteDataStore: NSObject, ObservableObject {
     }
 
     func fetchList(_ url: URL, completion: @escaping (Result<[VideoItem], Error>) -> Void) {
-        run(url, name: "list", extractor: Extractors.list) { result in
+        run(url, name: "list", extractor: Extractors.list) { [weak self] result in
+            guard let self = self else { return }
             switch result {
             case .success(let json):
                 guard let data = json.data(using: .utf8),
                       let payload = try? JSONDecoder().decode(ListPayload.self, from: data) else {
                     completion(.failure(SiteDataError.badResponse)); return
+                }
+                // 顺带更新导航真实地址（列表脚本每次都会带出来）
+                if let nav = payload.nav {
+                    var links = self.navLinks
+                    if let s = nav.home, !s.isEmpty { links["home"] = s }
+                    if let s = nav.rank, !s.isEmpty { links["rank"] = s }
+                    if let s = nav.subs, !s.isEmpty { links["subs"] = s }
+                    if let s = nav.mine, !s.isEmpty { links["mine"] = s }
+                    if links != self.navLinks {
+                        self.navLinks = links
+                        self.objectWillChange.send()
+                    }
                 }
                 let items = payload.items.map { VideoItem(title: $0.title, cover: $0.cover, url: $0.url) }
                 completion(.success(items))
@@ -270,6 +286,7 @@ final class SiteDataStore: NSObject, ObservableObject {
             return
         }
         ensureWebView()
+        applyBlockRulesIfNeeded()
         queue.append(PendingFetch(url: url, name: name, extractor: extractor, completion: completion))
         pump()
     }
@@ -279,6 +296,7 @@ final class SiteDataStore: NSObject, ObservableObject {
         busy = true
         queue.removeFirst()
         current = next
+        applyBlockRulesIfNeeded()
         wv.stopLoading()
         wv.load(URLRequest(url: next.url, timeoutInterval: 30))
     }
@@ -296,9 +314,14 @@ final class SiteDataStore: NSObject, ObservableObject {
 
     private var current: PendingFetch?
 
+    private struct NavLinks: Decodable {
+        let home: String?; let rank: String?; let subs: String?; let mine: String?
+    }
+
     private struct ListPayload: Decodable {
         let ok: Bool
         let items: [RawItem]
+        let nav: NavLinks?
         struct RawItem: Decodable { let title: String; let cover: String; let url: String }
     }
 
@@ -311,13 +334,6 @@ final class SiteDataStore: NSObject, ObservableObject {
         let sources: [String]
         let watchURL: String?
     }
-
-    private struct NavPayload: Decodable {
-        let home: String?
-        let rank: String?
-        let subs: String?
-        let mine: String?
-    }
 }
 
 // MARK: - 导航代理：加载完成 → 提取
@@ -326,14 +342,14 @@ extension SiteDataStore: WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard let cur = current else { return }
 
-        // Cloudflare 挑战页：等 5 秒让验证自动通过再提取
+        // Cloudflare 挑战页：等几秒让验证自动通过再提取
         webView.evaluateJavaScript(
             "(function(){var t=(document.body?document.body.innerText:'');return /just a moment|attention required|cf-chl|checking your browser/i.test(t)?'1':'0';})()"
         ) { [weak self] res, _ in
             DispatchQueue.main.async {
                 guard let self = self, self.current != nil else { return }
                 if (res as? String) == "1" {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
                         guard let self = self, self.current != nil else { return }
                         self.extract(cur, in: webView, attempt: 0)
                     }
@@ -352,21 +368,20 @@ extension SiteDataStore: WKNavigationDelegate {
         webView.evaluateJavaScript(pending.extractor) { [weak self] result, _ in
             DispatchQueue.main.async {
                 guard let self = self, self.current != nil else { return }
-                guard let json = result as? String, let data = json.data(using: .utf8) else {
+                guard let json = result as? String else {
                     self.finish(.failure(SiteDataError.empty))
                     return
                 }
                 // ok:false 可能是内容还没渲染好，重试一次
                 let looksEmpty = json.contains("\"ok\":false")
                 if looksEmpty && attempt < 1 {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                         guard let self = self, self.current != nil else { return }
                         self.extract(pending, in: webView, attempt: attempt + 1)
                     }
                     return
                 }
                 self.finish(.success(json))
-                _ = data
             }
         }
     }
