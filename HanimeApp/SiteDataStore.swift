@@ -91,7 +91,9 @@ enum Extractors {
         if (hrefAttr.indexOf("watch?v=") === -1 || seen[hrefAttr]) { continue; }
         var card = a.closest("div") || a;
         var img = a.querySelector("img") || card.querySelector("img");
-        var title = tidy(clean((img && (img.alt || img.title)) || ""));
+        var titleBox = a.querySelector(".title");
+        var title = tidy(clean((titleBox && titleBox.innerText) || ""));
+        if (!title) { title = tidy(clean((img && (img.alt || img.title)) || "")); }
         if (!title) { title = tidy(clean(a.innerText)); }
         if (!title) { title = tidy(clean(card.innerText)).slice(0, 60); }
         var cover = img ? (img.getAttribute("src") || img.getAttribute("data-src") || img.getAttribute("data-original") || "") : "";
@@ -257,6 +259,7 @@ final class SiteDataStore: NSObject, ObservableObject {
         let url: URL
         let name: String
         let extractor: String
+        let html: String?   // 非nil = 用净化 HTML 直接解析（快速通道）
         let completion: (Result<String, Error>) -> Void
     }
 
@@ -274,7 +277,7 @@ final class SiteDataStore: NSObject, ObservableObject {
     private static func compileBlockRules() {
         guard blockRules == nil else { return }
         let json = """
-        [{"trigger":{"url-filter":".*","resource-type":["image","stylesheet","font"]},"action":{"type":"block"}}]
+        [{"trigger":{"url-filter":".*","resource-type":["image","stylesheet","font","media"]},"action":{"type":"block"}}]
         """
         WKContentRuleListStore.default().compileContentRuleList(
             forIdentifier: "data-light",
@@ -421,8 +424,72 @@ final class SiteDataStore: NSObject, ObservableObject {
         }
         ensureWebView()
         applyBlockRulesIfNeeded()
-        queue.append(PendingFetch(url: url, name: name, extractor: extractor, completion: completion))
+        // 快速通道：原生直连抓 HTML（实测无 Cloudflare 挑战，几十 KB 秒回），
+        // 净化后灌进隐藏 WebView 解析；直连失败（挑战/网络）才回退到 WebView 实时加载
+        fetchHTML(url) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                switch result {
+                case .success(let html):
+                    self.enqueue(url: url, name: name, extractor: extractor,
+                                 html: Self.sanitize(html), completion: completion)
+                case .failure:
+                    self.enqueue(url: url, name: name, extractor: extractor,
+                                 html: nil, completion: completion)
+                }
+            }
+        }
+    }
+
+    private func enqueue(url: URL, name: String, extractor: String,
+                         html: String?,
+                         completion: @escaping (Result<String, Error>) -> Void) {
+        queue.append(PendingFetch(url: url, name: name, extractor: extractor, html: html, completion: completion))
         pump()
+    }
+
+    /// 原生直连抓取页面 HTML（手机 UA + Referer + 同步登录 Cookie）
+    private func fetchHTML(_ url: URL, completion: @escaping (Result<String, Error>) -> Void) {
+        WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+            for cookie in cookies where cookie.domain.contains("hanime") {
+                HTTPCookieStorage.shared.setCookie(cookie)
+            }
+            var req = URLRequest(url: url, timeoutInterval: 20)
+            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+            req.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+            req.setValue("https://hanime1.me/", forHTTPHeaderField: "Referer")
+            req.setValue("zh-CN,zh;q=0.9,en;q=0.8", forHTTPHeaderField: "Accept-Language")
+            URLSession.shared.dataTask(with: req) { data, response, error in
+                if let error = error { completion(.failure(error)); return }
+                guard let http = response as? HTTPURLResponse, let data = data,
+                      (200..<300).contains(http.statusCode) else {
+                    completion(.failure(SiteDataError.badResponse)); return
+                }
+                let html = String(data: data, encoding: .utf8)
+                    ?? String(data: data, encoding: .isoLatin1) ?? ""
+                // Cloudflare 挑战页：直连拿不到真实内容，交给 WebView 实时加载兜底
+                if html.range(of: "just a moment", options: [.regularExpression, .caseInsensitive]) != nil
+                    || html.range(of: "cf-chl", options: .caseInsensitive) != nil {
+                    completion(.failure(SiteDataError.badResponse)); return
+                }
+                completion(.success(html))
+            }.resume()
+        }
+    }
+
+    /// 净化 HTML：去掉 script / iframe，广告不会加载、内联 JS 不会捣乱，只留静态 DOM 供解析
+    private static func sanitize(_ html: String) -> String {
+        guard let scriptRe = try? NSRegularExpression(
+                  pattern: "<script[^>]*>[\\s\\S]*?</script>|<script[^>]*/>",
+                  options: [.caseInsensitive]),
+              let iframeRe = try? NSRegularExpression(
+                  pattern: "<iframe[^>]*>[\\s\\S]*?</iframe>|<iframe[^>]*/?>",
+                  options: [.caseInsensitive]) else { return html }
+        var out = scriptRe.stringByReplacingMatches(
+            in: html, range: NSRange(html.startIndex..., in: html), withTemplate: "")
+        out = iframeRe.stringByReplacingMatches(
+            in: out, range: NSRange(out.startIndex..., in: out), withTemplate: "")
+        return out
     }
 
     private func pump() {
@@ -433,7 +500,11 @@ final class SiteDataStore: NSObject, ObservableObject {
         capturedSources = []   // 每个页面只保留自己抓到的媒体地址
         applyBlockRulesIfNeeded()
         wv.stopLoading()
-        wv.load(URLRequest(url: next.url, timeoutInterval: 30))
+        if let html = next.html {
+            wv.loadHTMLString(html, baseURL: next.url)   // 静态 DOM 解析（快速通道）
+        } else {
+            wv.load(URLRequest(url: next.url, timeoutInterval: 30))   // 实时加载兜底
+        }
         startWatchdog()
     }
 
@@ -522,9 +593,10 @@ extension SiteDataStore: WKNavigationDelegate {
                     self.finish(.failure(SiteDataError.empty))
                     return
                 }
-                // ok:false 可能是内容还没渲染好 / 播放器还没拉流，多等几轮（同时等媒体请求回传）
+                // ok:false：HTML 快速通道内容是静态的，重试无意义；实时加载通道可能是还没渲染好/没拉流，多等几轮
                 let looksEmpty = json.contains("\"ok\":false")
-                if looksEmpty && attempt < 5 && self.capturedSources.isEmpty {
+                let maxAttempts = (self.current?.html != nil) ? 0 : 5
+                if looksEmpty && attempt < maxAttempts && self.capturedSources.isEmpty {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
                         guard let self = self, self.current != nil else { return }
                         self.extract(pending, in: webView, attempt: attempt + 1)
