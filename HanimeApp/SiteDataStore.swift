@@ -98,34 +98,67 @@ enum Extractors {
     """##
 
     /// 视频详情页：标题 / 封面 / 简介 / 标签 / m3u8·mp4 播放地址
+    /// 播放器常在内嵌 iframe（embed 页）里，主页面扫不到时用同源 fetch 抓 iframe 页面再扫
     static let watch: String = ##"""
     (function () {
       function clean(s) { return (s || "").replace(/\s+/g, " ").trim(); }
-      var raw = document.documentElement.innerHTML.replace(/\\\//g, "/");
-      var matches = raw.match(/https?:\/\/[^\s"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^"'<>\\\s]*)?/g) || [];
-      var uniq = [], seen = {};
-      for (var i = 0; i < matches.length; i++) {
-        var u = matches[i];
-        if (!seen[u]) { seen[u] = 1; uniq.push(u); }
+      function grab(text) {
+        var raw = (text || "").replace(/\\\//g, "/");
+        return raw.match(/https?:\/\/[^\s"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^"'<>\\\s]*)?/g) || [];
       }
       function og(name) {
-        var m = document.querySelector('meta[property="' + name + '"], meta[name="' + name + '"]');
-        return m ? clean(m.getAttribute("content")) : "";
+        var el = document.querySelector('meta[property="' + name + '"], meta[name="' + name + '"]');
+        return el ? clean(el.getAttribute("content")) : "";
       }
-      var h1 = document.querySelector("h1");
-      var title = clean((h1 && h1.innerText) || "") || og("og:title") || clean(document.title);
-      var cover = og("og:image");
-      var desc = og("og:description") || og("description");
-      var tags = [];
-      var tagAs = document.querySelectorAll('a[href*="search?query="], a[href*="genre"], .genre a, .tags a, .tag');
-      for (var j = 0; j < tagAs.length && tags.length < 12; j++) {
-        var t = clean(tagAs[j].innerText);
-        if (t && t.length <= 20 && tags.indexOf(t) < 0) { tags.push(t); }
+      function meta() {
+        var h1 = document.querySelector("h1");
+        var title = clean((h1 && h1.innerText) || "") || og("og:title") || clean(document.title);
+        var tags = [];
+        var tagAs = document.querySelectorAll('a[href*="search?query="], a[href*="genre"], .genre a, .tags a, .tag');
+        for (var j = 0; j < tagAs.length && tags.length < 12; j++) {
+          var t = clean(tagAs[j].innerText);
+          if (t && t.length <= 20 && tags.indexOf(t) < 0) { tags.push(t); }
+        }
+        return { title: title, cover: og("og:image"), desc: og("og:description") || og("description"), tags: tags };
       }
-      return JSON.stringify({
-        ok: uniq.length > 0,
-        title: title, cover: cover, desc: desc,
-        tags: tags, sources: uniq, watchURL: location.href
+      function dedupe(arr) {
+        var uniq = [], seen = {};
+        for (var i = 0; i < arr.length; i++) { if (!seen[arr[i]]) { seen[arr[i]] = 1; uniq.push(arr[i]); } }
+        return uniq;
+      }
+      return new Promise(function (resolve) {
+        var tries = 0;
+        var iframeSrcs = [];
+        function attempt() {
+          tries++;
+          var found = grab(document.documentElement.innerHTML);
+          var iframes = document.querySelectorAll("iframe");
+          iframeSrcs = [];
+          for (var i = 0; i < iframes.length; i++) {
+            var s = iframes[i].src || "";
+            if (s.indexOf(location.origin) === 0 && s !== location.href) { iframeSrcs.push(s); }
+          }
+          if (found.length === 0 && tries < 5) { setTimeout(attempt, 1500); return; }
+          fetchEmbeds(found);
+        }
+        function fetchEmbeds(found) {
+          var list = iframeSrcs.slice(0, 3);
+          var done = 0;
+          if (list.length === 0) { finish(found); return; }
+          list.forEach(function (u) {
+            fetch(u, { credentials: "include" })
+              .then(function (r) { return r.text(); })
+              .then(function (t) { found = found.concat(grab(t)); })
+              .catch(function () {})
+              .then(function () { done++; if (done >= list.length) { finish(found); } });
+          });
+        }
+        function finish(found) {
+          var uniq = dedupe(found);
+          var mm = meta();
+          resolve(JSON.stringify({ ok: uniq.length > 0, title: mm.title, cover: mm.cover, desc: mm.desc, tags: mm.tags, sources: uniq, watchURL: location.href }));
+        }
+        attempt();
       });
     })();
     """##
@@ -231,7 +264,18 @@ final class SiteDataStore: NSObject, ObservableObject {
                       let payload = try? JSONDecoder().decode(WatchPayload.self, from: data) else {
                     completion(.failure(SiteDataError.badResponse)); return
                 }
-                let sources: [VideoSource] = payload.sources.enumerated().map { (idx, u) in
+                // m3u8（自适应流，AVPlayer 直接支持）排前面；mp4 按清晰度数字从高到低
+                let sorted = payload.sources.sorted { a, b in
+                    let aHLS = a.contains(".m3u8"), bHLS = b.contains(".m3u8")
+                    if aHLS != bHLS { return aHLS }
+                    func res(_ s: String) -> Int {
+                        for h in [1080, 720, 480, 360, 240, 144] where s.contains(String(h)) { return h }
+                        return 0
+                    }
+                    if res(a) != res(b) { return res(a) > res(b) }
+                    return false
+                }
+                let sources: [VideoSource] = sorted.enumerated().map { (idx, u) in
                     VideoSource(label: Self.sourceLabel(u, index: idx), url: u)
                 }
                 guard !sources.isEmpty else {
@@ -299,9 +343,24 @@ final class SiteDataStore: NSObject, ObservableObject {
         applyBlockRulesIfNeeded()
         wv.stopLoading()
         wv.load(URLRequest(url: next.url, timeoutInterval: 30))
+        startWatchdog()
+    }
+
+    // 超时兜底：页面迟迟加载不完 / 提取脚本挂起时，强制结束当前任务，避免 UI 永远"解析中"
+    private var watchdog: DispatchWorkItem?
+    private func startWatchdog() {
+        watchdog?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self, self.current != nil else { return }
+            self.finish(.failure(SiteDataError.timeout))
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: work)
+        watchdog = work
     }
 
     private func finish(_ result: Result<String, Error>) {
+        watchdog?.cancel()
+        watchdog = nil
         guard let cur = current else { busy = false; return }
         current = nil
         busy = false
